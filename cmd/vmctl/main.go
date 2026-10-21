@@ -17,6 +17,7 @@ import (
 	"github.com/uday68/gdc-vm-operator/pkg/registry"
 	"github.com/uday68/gdc-vm-operator/pkg/runtime"
 	"github.com/uday68/gdc-vm-operator/pkg/scheduler"
+	"github.com/uday68/gdc-vm-operator/pkg/snapshot"
 	"github.com/uday68/gdc-vm-operator/pkg/store"
 	"github.com/uday68/gdc-vm-operator/pkg/telemetry"
 	"github.com/uday68/gdc-vm-operator/pkg/validator"
@@ -55,6 +56,8 @@ func main() {
 		cmdImages()
 	case "capacity", "node":
 		cmdCapacity()
+	case "snapshot":
+		cmdSnapshot(args)
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -81,6 +84,7 @@ Available Commands:
   delete <name>            Gracefully terminate and delete a Virtual Machine
   images                   List registered images in the offline air-gapped catalog
   capacity                 Inspect host node compute (CPU, RAM, Disk) and IPAM subnet capacity
+  snapshot <action>        Manage offline VM backups (create, list, restore)
 `)
 }
 
@@ -450,4 +454,86 @@ func cmdCapacity() {
 		cap.TotalDiskGB, cap.AllocatedDisk, cap.AvailableDisk, float64(cap.AllocatedDisk)/float64(cap.TotalDiskGB)*100)
 	fmt.Printf("IPAM Pool:  Subnet: 10.244.0.0/24 | Allocated IPs: %d | Available IPs: %d\n",
 		allocIPs, totalIPs-allocIPs)
+}
+
+func cmdSnapshot(args []string) {
+	if len(args) < 2 {
+		fmt.Println("Usage: vmctl snapshot [create <vm> <name> | list <vm> | restore <vm> <name> <dest-path>]")
+		return
+	}
+
+	snapDir := filepath.Join(defaultDataDir, "snapshots")
+	mgr, err := snapshot.NewManager(snapDir)
+	if err != nil {
+		fmt.Printf("Failed to open snapshot manager: %v\n", err)
+		return
+	}
+
+	action := args[0]
+	vmName := args[1]
+
+	s, reg, _, _, _, _ := getComponents()
+	vm, err := s.Get(vmName)
+	if err != nil && action != "restore" {
+		fmt.Println(err)
+		return
+	}
+
+	switch action {
+	case "create":
+		if len(args) < 3 {
+			fmt.Println("Usage: vmctl snapshot create <vm-name> <snapshot-name>")
+			return
+		}
+		snapName := args[2]
+		entry, found := reg.GetImage(vm.Spec.Image.Name)
+		if !found {
+			fmt.Printf("Disk image '%s' not found in registry\n", vm.Spec.Image.Name)
+			return
+		}
+		sourceDisk := reg.GetImagePath(entry.Filename)
+		meta, err := mgr.Create(vm, snapName, sourceDisk)
+		if err != nil {
+			fmt.Printf("Failed to create snapshot: %v\n", err)
+			return
+		}
+		fmt.Printf("Snapshot '%s' created successfully for VM '%s'\n", snapName, vmName)
+		fmt.Printf("SHA256 Checksum: %s (Size: %d bytes)\n", meta.SHA256Checksum, meta.SizeBytes)
+
+	case "list":
+		list, err := mgr.List(vmName)
+		if err != nil {
+			fmt.Printf("Failed to list snapshots: %v\n", err)
+			return
+		}
+		if len(list) == 0 {
+			fmt.Printf("No snapshots found for VM '%s'\n", vmName)
+			return
+		}
+		w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
+		fmt.Fprintln(w, "SNAPSHOT NAME\tVM NAME\tCREATED\tSIZE (BYTES)\tSHA256 CHECKSUM")
+		for _, s := range list {
+			fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n",
+				s.Name, s.VMName, s.Timestamp.Format(time.RFC3339), s.SizeBytes, s.SHA256Checksum)
+		}
+		w.Flush()
+
+	case "restore":
+		if len(args) < 4 {
+			fmt.Println("Usage: vmctl snapshot restore <vm-name> <snapshot-name> <target-disk-path>")
+			return
+		}
+		snapName := args[2]
+		targetPath := args[3]
+		meta, err := mgr.Restore(vmName, snapName, targetPath)
+		if err != nil {
+			fmt.Printf("Failed to restore snapshot: %v\n", err)
+			return
+		}
+		fmt.Printf("Restored snapshot '%s' to '%s' (Verified SHA256: %s)\n",
+			snapName, targetPath, meta.SHA256Checksum)
+
+	default:
+		fmt.Printf("Unknown snapshot action '%s'\n", action)
+	}
 }

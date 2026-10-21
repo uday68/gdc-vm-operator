@@ -295,3 +295,36 @@ In distributed infrastructure, individual VM validation is not enough. If a phys
 > *"I built a node capacity scheduler in `pkg/scheduler` inspired by `kube-scheduler`. The operator tracks cumulative host vCPU, memory, and disk commitments. During the validation phase, the reconciler checks `CanSchedule(vm)`. If the request would overcommit the physical node, the VM is queued in `Pending` with a descriptive condition, preventing host kernel panic or CPU starvation until peer workloads terminate and capacity is freed."*
 
 ---
+
+## Module 11: Rate-Limiting Exponential Backoff Workqueue (`pkg/workqueue/workqueue.go`)
+
+### 1. Conceptual Foundation
+In production Kubernetes operators (such as `client-go` and `controller-runtime`), event processing avoids dumb polling loops. When an event or crash occurs:
+1. **Deduplication:** Multiple rapid notifications for the same VM coalesce into a single work item (`dirty` vs `processing` tracking), preventing redundant reconciliations.
+2. **Exponential Backoff:** If reconciliation fails, `AddRateLimited(item)` calculates exponential delays:
+   $$T_{\text{wait}} = \min(T_{\text{base}} \times 2^{\text{retries}-1}, T_{\text{max}})$$
+   This prevents thundering-herd CPU spikes when an infrastructure component flaps.
+3. **Graceful Consumption:** Workers dequeue items using Go condition variables (`sync.Cond`) without busy-waiting.
+
+### 2. Google Interview Q&A
+**Q: How do you prevent CPU thrashing or thundering-herd issues during failure recovery?**  
+*Answer:*  
+> *"I implemented a rate-limiting workqueue modeled after Kubernetes `client-go/util/workqueue`. It provides event deduplication and exponential backoff retry scheduling. When a VM process crashes or encounters an error, the item is scheduled with an exponential backoff delay starting at 500ms and doubling up to a 16s ceiling. Once the VM successfully transitions to Running, `Forget(item)` resets failure counters."*
+
+---
+
+## Module 12: Air-Gapped Point-in-Time VM Snapshots (`pkg/snapshot/snapshot.go`)
+
+### 1. Conceptual Foundation
+In air-gapped critical infrastructure (defense, nuclear plants), operators cannot stream disk backups to public cloud object stores.
+`pkg/snapshot` implements an offline cryptographic snapshot engine:
+1. **Streaming Checksum Mirroring:** Uses `io.MultiWriter` to write the snapshot image and calculate the SHA-256 digest simultaneously in a single streaming pass ($O(1)$ memory).
+2. **Offline Manifests:** Stores immutable metadata (`SnapshotMeta`) recording snapshot time, source VM spec, size, and cryptographic hash.
+3. **Pre-Restore Verification:** Before restoring an image to a running VM disk, the engine verifies the SHA-256 checksum against the manifest to guarantee the backup was not corrupted or modified on disk.
+
+### 2. Google Interview Q&A
+**Q: How does your operator manage offline disaster recovery without external cloud storage?**  
+*Answer:*  
+> *"In `pkg/snapshot`, the operator provides local point-in-time state capture. Using `io.MultiWriter`, it creates a point-in-time copy while calculating its SHA-256 digest in a single streaming pass. During disaster recovery restoration, it re-verifies the artifact's cryptographic digest against the immutable manifest before overwriting disk blocks, preventing corrupted recovery operations."*
+
+---

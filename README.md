@@ -51,17 +51,22 @@ gdc-vm-operator/
 ├── api/
 │   └── v1alpha1/           # Kubernetes CRD schemas (Spec, Status, Conditions)
 ├── cmd/
-│   ├── vmctl/              # Operator CLI tool (init, apply, get, describe, logs)
+│   ├── vmctl/              # Operator CLI tool (init, apply, get, describe, logs, snapshot, capacity)
 │   └── vm-runner/          # Isolated guest hypervisor runner simulation
 ├── pkg/
 │   ├── registry/           # Air-gapped offline image repository & SHA-256 verifier
 │   ├── validator/          # Admission validation engine & security policy guards
 │   ├── store/              # Atomic state persistence & crash-recovery store
 │   ├── runtime/            # Cross-platform process supervisor & health telemetry
+│   ├── ipam/               # Deterministic CIDR subnet allocator & boundary guards
+│   ├── scheduler/          # Node capacity & resource overcommit controller
+│   ├── workqueue/          # Rate-limiting exponential backoff deduplicating queue
+│   ├── snapshot/           # Point-in-time offline disaster recovery & verify engine
+│   ├── telemetry/          # Prometheus metrics & Kubernetes /healthz probes
 │   └── reconciler/         # Level-triggered state reconciliation control loop
 ├── examples/               # Declarative YAML manifests (valid & air-gap violation)
 ├── docs/
-│   └── INTERVIEW_STUDY_GUIDE.md  # Complete system design & interview guide
+│   └── INTERVIEW_STUDY_GUIDE.md  # Complete 12-module system design & interview guide
 └── bin/                    # Compiled native binaries
 ```
 
