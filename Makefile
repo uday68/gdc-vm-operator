@@ -37,3 +37,4 @@ run: build
 clean:
 	@echo "==> Cleaning generated binaries and runtime data..."
 	rm -rf $(BINARY_DIR) data coverage.out
+

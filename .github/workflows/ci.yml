@@ -71,3 +71,4 @@ jobs:
           EXT=""
           if [ "${{ matrix.goos }}" = "windows" ]; then EXT=".exe"; fi
           go build -o bin/vmctl-${{ matrix.goos }}-${{ matrix.goarch }}${EXT} ./cmd/vmctl
+

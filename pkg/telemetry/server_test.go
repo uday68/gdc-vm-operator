@@ -75,3 +75,4 @@ func TestTelemetryServer_Endpoints(t *testing.T) {
 		t.Errorf("expected metric 'gdc_vm_restarts_total 2', got:\n%s", bodyStr)
 	}
 }
+

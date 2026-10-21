@@ -122,3 +122,4 @@ func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprintf(w, "# TYPE gdc_vm_restarts_total counter\n")
 	fmt.Fprintf(w, "gdc_vm_restarts_total %d\n", totalRestarts)
 }
+
