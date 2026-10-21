@@ -1,0 +1,222 @@
+package reconciler
+
+import (
+	"context"
+	"fmt"
+	"math/rand"
+	"sync"
+	"time"
+
+	"github.com/uday68/gdc-vm-operator/api/v1alpha1"
+	"github.com/uday68/gdc-vm-operator/pkg/registry"
+	"github.com/uday68/gdc-vm-operator/pkg/runtime"
+	"github.com/uday68/gdc-vm-operator/pkg/store"
+	"github.com/uday68/gdc-vm-operator/pkg/validator"
+)
+
+const MaxCrashRestarts = 3
+
+// Controller manages the continuous state reconciliation of Virtual Machines.
+type Controller struct {
+	store     store.Store
+	validator *validator.Validator
+	registry  *registry.LocalRegistry
+	runtime   runtime.VMRuntime
+	interval  time.Duration
+	stopChan  chan struct{}
+	wg        sync.WaitGroup
+	mu        sync.Mutex
+}
+
+// NewController builds a new Reconciler controller instance.
+func NewController(
+	s store.Store,
+	v *validator.Validator,
+	reg *registry.LocalRegistry,
+	rt runtime.VMRuntime,
+	interval time.Duration,
+) *Controller {
+	if interval <= 0 {
+		interval = 2 * time.Second
+	}
+	return &Controller{
+		store:     s,
+		validator: v,
+		registry:  reg,
+		runtime:   rt,
+		interval:  interval,
+		stopChan:  make(chan struct{}),
+	}
+}
+
+// Start initiates the reconciliation control loop.
+func (c *Controller) Start(ctx context.Context) {
+	ticker := time.NewTicker(c.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-c.stopChan:
+			return
+		case <-ticker.C:
+			c.ReconcileAll(ctx)
+		}
+	}
+}
+
+// Stop gracefully shuts down the background control loop.
+func (c *Controller) Stop() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	select {
+	case <-c.stopChan:
+		// already stopped
+	default:
+		close(c.stopChan)
+	}
+}
+
+// ReconcileAll runs one reconciliation pass across all registered VM resources.
+func (c *Controller) ReconcileAll(ctx context.Context) {
+	vms := c.store.List()
+	for _, vm := range vms {
+		if err := c.ReconcileOne(ctx, vm); err != nil {
+			// Log error without aborting reconciliation of peer VMs
+			fmt.Printf("[RECONCILER ERROR] Failed reconciling VM %s: %v\n", vm.Metadata.Name, err)
+		}
+	}
+}
+
+// ReconcileOne executes the core state machine for a single VirtualMachine resource.
+func (c *Controller) ReconcileOne(ctx context.Context, vm *v1alpha1.VirtualMachine) error {
+	switch vm.Status.Phase {
+	case "", v1alpha1.PhasePending, v1alpha1.PhaseValidating:
+		return c.handleValidation(vm)
+
+	case v1alpha1.PhaseProvisioning:
+		return c.handleProvisioning(ctx, vm)
+
+	case v1alpha1.PhaseRunning:
+		return c.handleRunningHealth(ctx, vm)
+
+	case v1alpha1.PhaseTerminating:
+		return c.handleTerminating(ctx, vm)
+
+	case v1alpha1.PhaseDegraded, v1alpha1.PhaseStopped, v1alpha1.PhaseFailed:
+		// Terminal or halted states: no active reconciler transition unless user intervenes
+		return nil
+
+	default:
+		return nil
+	}
+}
+
+func (c *Controller) handleValidation(vm *v1alpha1.VirtualMachine) error {
+	if err := c.validator.Validate(vm); err != nil {
+		vm.Status.Phase = v1alpha1.PhaseFailed
+		vm.Status.Message = fmt.Sprintf("Admission validation failed: %v", err)
+		vm.Status.LastTransitionTime = time.Now()
+		vm.SetCondition("Validated", v1alpha1.ConditionFalse, "ValidationError", err.Error())
+		return c.store.Save(vm)
+	}
+
+	vm.Status.Phase = v1alpha1.PhaseProvisioning
+	vm.Status.Message = "Validation passed. Scheduling resources and disk image."
+	vm.Status.LastTransitionTime = time.Now()
+	vm.SetCondition("Validated", v1alpha1.ConditionTrue, "AdmissionSuccess", "All air-gap and hardware constraints satisfied")
+	return c.store.Save(vm)
+}
+
+func (c *Controller) handleProvisioning(ctx context.Context, vm *v1alpha1.VirtualMachine) error {
+	entry, found := c.registry.GetImage(vm.Spec.Image.Name)
+	if !found {
+		vm.Status.Phase = v1alpha1.PhaseFailed
+		vm.Status.Message = fmt.Sprintf("Image %s not found in registry catalog", vm.Spec.Image.Name)
+		vm.Status.LastTransitionTime = time.Now()
+		vm.SetCondition("Provisioned", v1alpha1.ConditionFalse, "ImageNotFound", vm.Status.Message)
+		return c.store.Save(vm)
+	}
+
+	imagePath := c.registry.GetImagePath(entry.Filename)
+	pid, err := c.runtime.Start(ctx, vm, imagePath)
+	if err != nil {
+		vm.Status.Phase = v1alpha1.PhaseFailed
+		vm.Status.Message = fmt.Sprintf("Runtime process start failed: %v", err)
+		vm.Status.LastTransitionTime = time.Now()
+		vm.SetCondition("Ready", v1alpha1.ConditionFalse, "RuntimeStartError", err.Error())
+		return c.store.Save(vm)
+	}
+
+	vm.Status.Phase = v1alpha1.PhaseRunning
+	vm.Status.PID = pid
+	vm.Status.AllocatedIP = fmt.Sprintf("10.244.0.%d", 10+rand.Intn(200))
+	vm.Status.Message = fmt.Sprintf("Virtual machine active on host with PID %d", pid)
+	vm.Status.LastTransitionTime = time.Now()
+	vm.SetCondition("Ready", v1alpha1.ConditionTrue, "VMRunning", vm.Status.Message)
+	return c.store.Save(vm)
+}
+
+func (c *Controller) handleRunningHealth(ctx context.Context, vm *v1alpha1.VirtualMachine) error {
+	// Inspect if process is still active
+	if c.runtime.IsAlive(vm.Status.PID) {
+		// VM is healthy
+		return nil
+	}
+
+	// Process died! Self-healing reconciliation triggered.
+	fmt.Printf("[SELF-HEALING] Detected crash of VM %s (PID %d)\n", vm.Metadata.Name, vm.Status.PID)
+
+	policy := vm.Spec.RestartPolicy
+	if policy == "" {
+		policy = v1alpha1.RestartPolicyAlways
+	}
+
+	if policy == v1alpha1.RestartPolicyNever {
+		vm.Status.Phase = v1alpha1.PhaseStopped
+		vm.Status.Message = "Process exited, RestartPolicy is Never"
+		vm.Status.LastTransitionTime = time.Now()
+		vm.SetCondition("Ready", v1alpha1.ConditionFalse, "ProcessExited", vm.Status.Message)
+		return c.store.Save(vm)
+	}
+
+	// Check restart threshold
+	if vm.Status.RestartCount >= MaxCrashRestarts {
+		vm.Status.Phase = v1alpha1.PhaseDegraded
+		vm.Status.Message = fmt.Sprintf("Max restart attempts (%d) exceeded. Marked as Degraded (CrashLoopBackoff)", MaxCrashRestarts)
+		vm.Status.LastTransitionTime = time.Now()
+		vm.SetCondition("Ready", v1alpha1.ConditionFalse, "CrashLoopBackoff", vm.Status.Message)
+		return c.store.Save(vm)
+	}
+
+	// Attempt self-healing restart
+	entry, found := c.registry.GetImage(vm.Spec.Image.Name)
+	if !found {
+		vm.Status.Phase = v1alpha1.PhaseFailed
+		vm.Status.Message = "Image vanished during restart attempt"
+		return c.store.Save(vm)
+	}
+
+	imagePath := c.registry.GetImagePath(entry.Filename)
+	newPid, err := c.runtime.Start(ctx, vm, imagePath)
+	if err != nil {
+		vm.Status.Message = fmt.Sprintf("Self-healing restart attempt failed: %v", err)
+		return c.store.Save(vm)
+	}
+
+	vm.Status.PID = newPid
+	vm.Status.RestartCount++
+	vm.Status.Message = fmt.Sprintf("Self-healed: restarted with new PID %d (Restart count: %d)", newPid, vm.Status.RestartCount)
+	vm.Status.LastTransitionTime = time.Now()
+	vm.SetCondition("Ready", v1alpha1.ConditionTrue, "SelfHealedRestart", vm.Status.Message)
+	return c.store.Save(vm)
+}
+
+func (c *Controller) handleTerminating(ctx context.Context, vm *v1alpha1.VirtualMachine) error {
+	if vm.Status.PID > 0 {
+		_ = c.runtime.Stop(vm.Status.PID)
+	}
+	// Object cleaned up from store
+	return c.store.Delete(vm.Metadata.Name)
+}

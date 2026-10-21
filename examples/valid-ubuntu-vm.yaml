@@ -1,0 +1,15 @@
+apiVersion: gdc.infrastructure.io/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: database-primary
+spec:
+  resources:
+    vcpu: 2
+    memoryMb: 4096
+    diskGb: 50
+  image:
+    name: ubuntu-22.04
+    checksumSha256: "459a16578b74c4501c5abae1d3fc5ba66d0aafc0b29b01298628be29596d56cb"
+  restartPolicy: Always
+  network:
+    isolated: true

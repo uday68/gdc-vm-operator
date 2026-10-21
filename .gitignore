@@ -1,0 +1,10 @@
+# Binaries
+bin/
+*.exe
+
+# Runtime working directory
+data/
+
+# OS specific
+.DS_Store
+Thumbs.db

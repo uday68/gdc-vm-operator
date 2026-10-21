@@ -1,0 +1,13 @@
+apiVersion: gdc.infrastructure.io/v1alpha1
+kind: VirtualMachine
+metadata:
+  name: malicious-remote-fetch
+spec:
+  resources:
+    vcpu: 1
+    memoryMb: 1024
+    diskGb: 10
+  image:
+    name: ubuntu-22.04
+    remoteUrl: "https://unauthorized-public-mirror.com/image.iso"
+  restartPolicy: OnFailure
