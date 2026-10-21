@@ -1,3 +1,7 @@
+// Package main implements vm-runner, a lightweight guest workload simulation process.
+// It is intended for testing and demonstration of VM lifecycle orchestration (boot, heartbeat,
+// graceful signal handling, and shutdown) without requiring hypervisor or root privileges.
+// It does NOT run actual hypervisor virtual machines or containerized workloads.
 package main
 
 import (

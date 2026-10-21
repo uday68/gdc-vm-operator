@@ -127,3 +127,34 @@ func (vm *VirtualMachine) SetCondition(condType string, status ConditionStatus, 
 	})
 }
 
+
+// DeepCopy returns an independent, thread-safe deep copy of the VirtualMachine.
+func (vm *VirtualMachine) DeepCopy() *VirtualMachine {
+	if vm == nil {
+		return nil
+	}
+
+	clone := *vm
+
+	// Deep copy Metadata Labels map
+	if vm.Metadata.Labels != nil {
+		clone.Metadata.Labels = make(map[string]string, len(vm.Metadata.Labels))
+		for k, v := range vm.Metadata.Labels {
+			clone.Metadata.Labels[k] = v
+		}
+	}
+
+	// Deep copy Network AllowedPorts slice
+	if vm.Spec.Network.AllowedPorts != nil {
+		clone.Spec.Network.AllowedPorts = make([]int, len(vm.Spec.Network.AllowedPorts))
+		copy(clone.Spec.Network.AllowedPorts, vm.Spec.Network.AllowedPorts)
+	}
+
+	// Deep copy Status Conditions slice
+	if vm.Status.Conditions != nil {
+		clone.Status.Conditions = make([]VMCondition, len(vm.Status.Conditions))
+		copy(clone.Status.Conditions, vm.Status.Conditions)
+	}
+
+	return &clone
+}

@@ -43,13 +43,15 @@ func TestFileStore_CRUDAndRecovery(t *testing.T) {
 		t.Fatalf("failed to save VM: %v", err)
 	}
 
-	// 2. Get
+	// 2. Deep-copy isolation test
 	fetched, err := s.Get("test-vm-01")
 	if err != nil {
 		t.Fatalf("failed to get VM: %v", err)
 	}
-	if fetched.Spec.Resources.VCPU != 2 {
-		t.Errorf("expected 2 vCPUs, got %d", fetched.Spec.Resources.VCPU)
+	fetched.Spec.Resources.VCPU = 99 // mutate fetched object
+	refetched, _ := s.Get("test-vm-01")
+	if refetched.Spec.Resources.VCPU != 2 {
+		t.Errorf("expected 2 vCPUs in store after external mutation, got %d", refetched.Spec.Resources.VCPU)
 	}
 
 	// 3. Verify on-disk file was created
@@ -58,7 +60,11 @@ func TestFileStore_CRUDAndRecovery(t *testing.T) {
 		t.Fatalf("state file was not created on disk: %s", stateFile)
 	}
 
-	// 4. Test Crash Recovery: Initialize a new store on the same directory
+	// 4. Create an orphan .tmp- file to verify recovery ignores it
+	orphanTmp := filepath.Join(tempDir, ".tmp-orphan-123.yaml")
+	_ = os.WriteFile(orphanTmp, []byte("broken temp"), 0644)
+
+	// 5. Test Crash Recovery: Initialize a new store on the same directory
 	recoveredStore, err := NewFileStore(tempDir)
 	if err != nil {
 		t.Fatalf("failed to reload store from disk: %v", err)
@@ -70,13 +76,46 @@ func TestFileStore_CRUDAndRecovery(t *testing.T) {
 	if recoveredVM.Metadata.Name != "test-vm-01" {
 		t.Errorf("expected 'test-vm-01', got '%s'", recoveredVM.Metadata.Name)
 	}
+	if len(recoveredStore.List()) != 1 {
+		t.Errorf("expected 1 VM recovered (ignoring orphan temp), got %d", len(recoveredStore.List()))
+	}
 
-	// 5. Delete
+	// 6. Delete
 	if err := s.Delete("test-vm-01"); err != nil {
 		t.Fatalf("failed to delete VM: %v", err)
 	}
 	if _, err := s.Get("test-vm-01"); err == nil {
 		t.Fatalf("expected error getting deleted VM, got nil")
+	}
+}
+
+func TestFileStore_PathTraversalRejection(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "gdc-store-traversal-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	s, err := NewFileStore(tempDir)
+	if err != nil {
+		t.Fatalf("failed to init store: %v", err)
+	}
+
+	traversalVM := &v1alpha1.VirtualMachine{
+		Metadata: v1alpha1.ObjectMeta{Name: "../../escape-vm"},
+		Spec:     v1alpha1.VirtualMachineSpec{Resources: v1alpha1.ResourceRequirements{VCPU: 1}},
+	}
+
+	if err := s.Save(traversalVM); err == nil {
+		t.Fatalf("expected Save with traversal name to fail, but succeeded")
+	}
+
+	if _, err := s.Get("../../escape-vm"); err == nil {
+		t.Fatalf("expected Get with traversal name to fail, but succeeded")
+	}
+
+	if err := s.Delete("../../escape-vm"); err == nil {
+		t.Fatalf("expected Delete with traversal name to fail, but succeeded")
 	}
 }
 
@@ -113,4 +152,3 @@ func TestFileStore_ConcurrentAccess(t *testing.T) {
 
 	wg.Wait()
 }
-

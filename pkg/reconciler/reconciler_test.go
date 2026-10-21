@@ -8,13 +8,15 @@ import (
 	"time"
 
 	"github.com/uday68/gdc-vm-operator/api/v1alpha1"
+	"github.com/uday68/gdc-vm-operator/pkg/ipam"
 	"github.com/uday68/gdc-vm-operator/pkg/registry"
 	"github.com/uday68/gdc-vm-operator/pkg/runtime"
+	"github.com/uday68/gdc-vm-operator/pkg/scheduler"
 	"github.com/uday68/gdc-vm-operator/pkg/store"
 	"github.com/uday68/gdc-vm-operator/pkg/validator"
 )
 
-func setupTestEnvironment(t *testing.T) (*Controller, store.Store, runtime.VMRuntime, func()) {
+func setupTestEnvironment(t *testing.T) (*Controller, store.Store, runtime.VMRuntime, *scheduler.Scheduler, *ipam.IPAM, func()) {
 	t.Helper()
 	tempDir, err := os.MkdirTemp("", "gdc-reconciler-test-*")
 	if err != nil {
@@ -50,17 +52,20 @@ func setupTestEnvironment(t *testing.T) (*Controller, store.Store, runtime.VMRun
 		t.Fatalf("failed to init runtime: %v", err)
 	}
 
-	ctrl := NewController(s, v, reg, rt, nil, nil, 500*time.Millisecond)
+	ipamMgr, _ := ipam.NewIPAM("10.244.0.0/24")
+	sched := scheduler.NewScheduler(16, 32768, 1000)
+
+	ctrl := NewController(s, v, reg, rt, ipamMgr, sched, 500*time.Millisecond)
 
 	cleanup := func() {
 		os.RemoveAll(tempDir)
 	}
 
-	return ctrl, s, rt, cleanup
+	return ctrl, s, rt, sched, ipamMgr, cleanup
 }
 
 func TestReconciler_ProvisioningAndSelfHealing(t *testing.T) {
-	ctrl, s, rt, cleanup := setupTestEnvironment(t)
+	ctrl, s, rt, _, _, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
 	vm := &v1alpha1.VirtualMachine{
@@ -132,7 +137,7 @@ func TestReconciler_ProvisioningAndSelfHealing(t *testing.T) {
 }
 
 func TestReconciler_AirGapRejection(t *testing.T) {
-	ctrl, s, _, cleanup := setupTestEnvironment(t)
+	ctrl, s, _, _, _, cleanup := setupTestEnvironment(t)
 	defer cleanup()
 
 	vm := &v1alpha1.VirtualMachine{
@@ -160,3 +165,111 @@ func TestReconciler_AirGapRejection(t *testing.T) {
 	}
 }
 
+func TestReconciler_FailureUnwindsSchedulerAndIPAM(t *testing.T) {
+	ctrl, s, _, sched, ipamMgr, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	// 1. Create and register an image properly in registry/images
+	testDiskFile, _ := ctrl.registry.GetImagePath("failing-disk.qcow2")
+	_ = os.WriteFile(testDiskFile, []byte("disk-content"), 0644)
+
+	_, err := ctrl.registry.RegisterImage("failing-disk-image", "failing-disk.qcow2", "linux", "Failing Disk Test")
+	if err != nil {
+		t.Fatalf("failed registering test image: %v", err)
+	}
+
+	// 2. Now delete the disk binary file so runtime.Start will fail during provisioning!
+	_ = os.Remove(testDiskFile)
+
+	vm := &v1alpha1.VirtualMachine{
+		Metadata: v1alpha1.ObjectMeta{Name: "failing-vm"},
+		Spec: v1alpha1.VirtualMachineSpec{
+			Resources: v1alpha1.ResourceRequirements{VCPU: 4, MemoryMB: 4096, DiskGB: 50},
+			Image:     v1alpha1.ImageSource{Name: "failing-disk-image"},
+		},
+		Status: v1alpha1.VirtualMachineStatus{Phase: v1alpha1.PhasePending},
+	}
+	_ = s.Save(vm)
+	ctx := context.Background()
+
+	// Step 1: Validation passes and reserves capacity
+	_ = ctrl.ReconcileOne(ctx, vm)
+	v1, _ := s.Get("failing-vm")
+	if v1.Status.Phase != v1alpha1.PhaseProvisioning {
+		t.Fatalf("expected PhaseProvisioning, got %s: %s", v1.Status.Phase, v1.Status.Message)
+	}
+	if sched.CapacityReport().AllocatedVCPU != 4 {
+		t.Errorf("expected 4 vCPUs allocated, got %d", sched.CapacityReport().AllocatedVCPU)
+	}
+
+	// Step 2: Provisioning fails because disk is missing -> MUST unwind capacity & IP
+	_ = ctrl.ReconcileOne(ctx, v1)
+	v2, _ := s.Get("failing-vm")
+	if v2.Status.Phase != v1alpha1.PhaseFailed {
+		t.Fatalf("expected PhaseFailed, got %s", v2.Status.Phase)
+	}
+
+	// Check unwound scheduler capacity
+	cap := sched.CapacityReport()
+	if cap.AllocatedVCPU != 0 {
+		t.Errorf("regression: scheduler capacity leaked on failure! Expected 0 vCPU, got %d", cap.AllocatedVCPU)
+	}
+
+	// Check unwound IPAM
+	allocIPs, _ := ipamMgr.Stats()
+	if allocIPs != 0 {
+		t.Errorf("regression: IPAM IP leaked on failure! Expected 0 allocated IPs, got %d", allocIPs)
+	}
+}
+
+func TestReconciler_TerminationUnwindsResources(t *testing.T) {
+	ctrl, s, rt, sched, ipamMgr, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	vm := &v1alpha1.VirtualMachine{
+		Metadata: v1alpha1.ObjectMeta{Name: "term-vm"},
+		Spec: v1alpha1.VirtualMachineSpec{
+			Resources: v1alpha1.ResourceRequirements{VCPU: 2, MemoryMB: 2048, DiskGB: 20},
+			Image:     v1alpha1.ImageSource{Name: "ubuntu-minimal"},
+		},
+		Status: v1alpha1.VirtualMachineStatus{Phase: v1alpha1.PhasePending},
+	}
+	_ = s.Save(vm)
+	ctx := context.Background()
+
+	// Pending -> Provisioning -> Running
+	_ = ctrl.ReconcileOne(ctx, vm)
+	v1, _ := s.Get("term-vm")
+	_ = ctrl.ReconcileOne(ctx, v1)
+	v2, _ := s.Get("term-vm")
+	if v2.Status.Phase != v1alpha1.PhaseRunning {
+		t.Fatalf("expected PhaseRunning, got %s", v2.Status.Phase)
+	}
+
+	// Verify resources are committed
+	if sched.CapacityReport().AllocatedVCPU != 2 {
+		t.Errorf("expected 2 vCPUs allocated")
+	}
+
+	// Trigger Termination
+	v2.Status.Phase = v1alpha1.PhaseTerminating
+	_ = s.Save(v2)
+	_ = ctrl.ReconcileOne(ctx, v2)
+
+	// Verify removed from store
+	if _, err := s.Get("term-vm"); err == nil {
+		t.Errorf("expected VM to be deleted from store")
+	}
+
+	// Verify resources unwound
+	if sched.CapacityReport().AllocatedVCPU != 0 {
+		t.Errorf("expected 0 vCPUs allocated after termination")
+	}
+	allocIPs, _ := ipamMgr.Stats()
+	if allocIPs != 0 {
+		t.Errorf("expected 0 IPs allocated after termination")
+	}
+
+	// Clean up process if still running
+	_ = rt.Stop(v2.Status.PID)
+}

@@ -5,12 +5,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
-	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/uday68/gdc-vm-operator/api/v1alpha1"
+	"github.com/uday68/gdc-vm-operator/pkg/pathutil"
 )
 
 // VMRuntime defines the lifecycle operations for virtual machine host processes.
@@ -21,36 +22,58 @@ type VMRuntime interface {
 	GetLogs(vmName string) (string, error)
 }
 
-// ProcessVMRuntime runs VMs as isolated host processes, simulating hypervisor execution.
+// ProcessVMRuntime executes isolated guest simulation processes to demonstrate VM workload lifecycles.
+// Note: This is a prototype workload simulation and does not control bare-metal hypervisors or production KVM VMs.
 type ProcessVMRuntime struct {
 	logsDir   string
 	runnerBin string
 	mu        sync.RWMutex
 }
 
-// NewProcessVMRuntime constructs the runtime engine.
+// NewProcessVMRuntime constructs the simulation runtime engine.
 func NewProcessVMRuntime(logsDir, runnerBin string) (*ProcessVMRuntime, error) {
+	if strings.TrimSpace(logsDir) == "" {
+		return nil, fmt.Errorf("logs directory cannot be empty")
+	}
+
 	if err := os.MkdirAll(logsDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create logs directory: %w", err)
 	}
+
 	return &ProcessVMRuntime{
 		logsDir:   logsDir,
 		runnerBin: runnerBin,
 	}, nil
 }
 
-// Start launches a new VM process and redirects stdout/stderr to a log file.
+// Start launches a new simulated VM process and redirects stdout/stderr to a log file.
 func (r *ProcessVMRuntime) Start(ctx context.Context, vm *v1alpha1.VirtualMachine, imagePath string) (int, error) {
+	if vm == nil {
+		return 0, fmt.Errorf("virtual machine manifest cannot be nil")
+	}
+	if err := pathutil.ValidateResourceName(vm.Metadata.Name); err != nil {
+		return 0, fmt.Errorf("invalid VM name for runtime: %w", err)
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
-	logFilePath := filepath.Join(r.logsDir, fmt.Sprintf("%s.log", vm.Metadata.Name))
+	// Verify disk image artifact exists on host filesystem before launching workload
+	if _, err := os.Stat(imagePath); err != nil {
+		return 0, fmt.Errorf("disk image '%s' is inaccessible or does not exist: %w", imagePath, err)
+	}
+
+	logFilePath, err := pathutil.SafeJoin(r.logsDir, fmt.Sprintf("%s.log", vm.Metadata.Name))
+	if err != nil {
+		return 0, fmt.Errorf("unsafe log file path: %w", err)
+	}
+
 	logFile, err := os.OpenFile(logFilePath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 	if err != nil {
 		return 0, fmt.Errorf("failed to open VM log file: %w", err)
 	}
 
-	// Prepare process arguments
+	// Prepare simulation process arguments
 	args := []string{
 		"--name", vm.Metadata.Name,
 		"--vcpu", strconv.Itoa(vm.Spec.Resources.VCPU),
@@ -60,10 +83,10 @@ func (r *ProcessVMRuntime) Start(ctx context.Context, vm *v1alpha1.VirtualMachin
 
 	var cmd *exec.Cmd
 	if r.runnerBin != "" {
-		cmd = exec.Command(r.runnerBin, args...)
+		cmd = exec.CommandContext(ctx, r.runnerBin, args...)
 	} else {
-		// Fallback self-runner using Go run or background loop
-		cmd = exec.Command("powershell", "-NoProfile", "-Command", fmt.Sprintf(
+		// Fallback self-runner loop
+		cmd = exec.CommandContext(ctx, "powershell", "-NoProfile", "-Command", fmt.Sprintf(
 			"Write-Host '[BOOT] Initializing %s (vCPU: %d, RAM: %dMB)'; while($true) { Start-Sleep -Seconds 1; Write-Host '[HEARTBEAT] %s alive' }",
 			vm.Metadata.Name, vm.Spec.Resources.VCPU, vm.Spec.Resources.MemoryMB, vm.Metadata.Name,
 		))
@@ -78,14 +101,26 @@ func (r *ProcessVMRuntime) Start(ctx context.Context, vm *v1alpha1.VirtualMachin
 	}
 
 	pid := cmd.Process.Pid
-	// Write initial startup marker
-	_, _ = fmt.Fprintf(logFile, "[OPERATOR] Process started with PID: %d at %s\n", pid, time.Now().UTC().Format(time.RFC3339))
-	_ = logFile.Close()
+	// Record initial startup marker and flush
+	startMsg := fmt.Sprintf("[OPERATOR] Process started with PID: %d at %s\n", pid, time.Now().UTC().Format(time.RFC3339))
+	if _, err := logFile.WriteString(startMsg); err != nil {
+		_ = logFile.Close()
+		return pid, fmt.Errorf("failed writing startup marker to log: %w", err)
+	}
+
+	if err := logFile.Sync(); err != nil {
+		_ = logFile.Close()
+		return pid, fmt.Errorf("failed syncing log file: %w", err)
+	}
+
+	if err := logFile.Close(); err != nil {
+		return pid, fmt.Errorf("failed closing log file: %w", err)
+	}
 
 	return pid, nil
 }
 
-// Stop gracefully terminates a VM process, falling back to force kill.
+// Stop gracefully terminates a simulated VM process, falling back to force kill.
 func (r *ProcessVMRuntime) Stop(pid int) error {
 	if pid <= 0 {
 		return nil
@@ -95,9 +130,14 @@ func (r *ProcessVMRuntime) Stop(pid int) error {
 	if err != nil {
 		return nil
 	}
+	defer func() {
+		_ = proc.Release()
+	}()
 
 	// Terminate process
-	_ = proc.Kill()
+	if err := proc.Kill(); err != nil && r.IsAlive(pid) {
+		return fmt.Errorf("failed killing process PID %d: %w", pid, err)
+	}
 
 	// Wait up to 3 seconds for release
 	for i := 0; i < 6; i++ {
@@ -105,6 +145,10 @@ func (r *ProcessVMRuntime) Stop(pid int) error {
 			return nil
 		}
 		time.Sleep(500 * time.Millisecond)
+	}
+
+	if r.IsAlive(pid) {
+		return fmt.Errorf("timed out waiting for process PID %d to terminate", pid)
 	}
 
 	return nil
@@ -117,7 +161,15 @@ func (r *ProcessVMRuntime) IsAlive(pid int) bool {
 
 // GetLogs returns the accumulated log content for a VM.
 func (r *ProcessVMRuntime) GetLogs(vmName string) (string, error) {
-	logFilePath := filepath.Join(r.logsDir, fmt.Sprintf("%s.log", vmName))
+	if err := pathutil.ValidateResourceName(vmName); err != nil {
+		return "", fmt.Errorf("invalid VM name: %w", err)
+	}
+
+	logFilePath, err := pathutil.SafeJoin(r.logsDir, fmt.Sprintf("%s.log", vmName))
+	if err != nil {
+		return "", err
+	}
+
 	data, err := os.ReadFile(logFilePath)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -127,4 +179,3 @@ func (r *ProcessVMRuntime) GetLogs(vmName string) (string, error) {
 	}
 	return string(data), nil
 }
-

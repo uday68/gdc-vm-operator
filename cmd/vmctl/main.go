@@ -118,15 +118,23 @@ func getComponents() (store.Store, *registry.LocalRegistry, *validator.Validator
 		os.Exit(1)
 	}
 
-	ipamMgr, _ := ipam.NewIPAM("10.244.0.0/24")
+	ipamMgr, err := ipam.NewIPAM("10.244.0.0/24")
+	if err != nil {
+		fmt.Printf("Failed to initialize IPAM: %v\n", err)
+		os.Exit(1)
+	}
 	sched := scheduler.NewScheduler(16, 32768, 1000)
 
 	// Pre-populate reservations & IPAM from active VMs in state
 	for _, vm := range s.List() {
 		if vm.Status.Phase == v1alpha1.PhaseRunning || vm.Status.Phase == v1alpha1.PhaseProvisioning {
-			_ = sched.Reserve(vm)
+			if err := sched.Reserve(vm); err != nil {
+				fmt.Printf("Warning: failed to restore scheduler reservation for VM %s: %v\n", vm.Metadata.Name, err)
+			}
 			if vm.Status.AllocatedIP != "" {
-				_, _ = ipamMgr.Allocate(vm.Metadata.Name)
+				if _, err := ipamMgr.Allocate(vm.Metadata.Name); err != nil {
+					fmt.Printf("Warning: failed to restore IPAM allocation for VM %s: %v\n", vm.Metadata.Name, err)
+				}
 			}
 		}
 	}
@@ -136,11 +144,18 @@ func getComponents() (store.Store, *registry.LocalRegistry, *validator.Validator
 
 func cmdInit() {
 	fmt.Println("[INIT] Initializing air-gapped environment directories...")
-	_ = os.MkdirAll(filepath.Join(defaultDataDir, "state"), 0755)
-	_ = os.MkdirAll(filepath.Join(defaultDataDir, "logs"), 0755)
-	imagesDir := filepath.Join(defaultDataDir, "registry", "images")
-	_ = os.MkdirAll(imagesDir, 0755)
-	_ = os.MkdirAll("examples", 0755)
+	dirs := []string{
+		filepath.Join(defaultDataDir, "state"),
+		filepath.Join(defaultDataDir, "logs"),
+		filepath.Join(defaultDataDir, "registry", "images"),
+		"examples",
+	}
+	for _, dir := range dirs {
+		if err := os.MkdirAll(dir, 0755); err != nil {
+			fmt.Printf("Error creating directory '%s': %v\n", dir, err)
+			return
+		}
+	}
 
 	// Seed sample offline images
 	regDir := filepath.Join(defaultDataDir, "registry")
@@ -150,17 +165,31 @@ func cmdInit() {
 		return
 	}
 
+	imagesDir := filepath.Join(defaultDataDir, "registry", "images")
 	ubuntuFile := filepath.Join(imagesDir, "ubuntu-22.04.qcow2")
 	if _, err := os.Stat(ubuntuFile); os.IsNotExist(err) {
-		_ = os.WriteFile(ubuntuFile, []byte("OFFLINE_PREINSTALLED_UBUNTU_22.04_BINARY_IMAGE_PAYLOAD"), 0644)
+		if err := os.WriteFile(ubuntuFile, []byte("OFFLINE_PREINSTALLED_UBUNTU_22.04_BINARY_IMAGE_PAYLOAD"), 0644); err != nil {
+			fmt.Printf("Failed writing sample Ubuntu image payload: %v\n", err)
+			return
+		}
 	}
-	uEntry, _ := reg.RegisterImage("ubuntu-22.04", "ubuntu-22.04.qcow2", "linux", "Ubuntu Server 22.04 LTS (Air-gapped gold image)")
+	uEntry, err := reg.RegisterImage("ubuntu-22.04", "ubuntu-22.04.qcow2", "linux", "Ubuntu Server 22.04 LTS (Air-gapped gold image)")
+	if err != nil {
+		fmt.Printf("Failed to register sample Ubuntu image: %v\n", err)
+		return
+	}
 
 	cirrosFile := filepath.Join(imagesDir, "cirros-0.5.2.img")
 	if _, err := os.Stat(cirrosFile); os.IsNotExist(err) {
-		_ = os.WriteFile(cirrosFile, []byte("OFFLINE_PREINSTALLED_CIRROS_TINY_TEST_PAYLOAD"), 0644)
+		if err := os.WriteFile(cirrosFile, []byte("OFFLINE_PREINSTALLED_CIRROS_TINY_TEST_PAYLOAD"), 0644); err != nil {
+			fmt.Printf("Failed writing sample CirrOS image payload: %v\n", err)
+			return
+		}
 	}
-	_, _ = reg.RegisterImage("cirros-0.5.2", "cirros-0.5.2.img", "linux", "CirrOS 0.5.2 Minimal Cloud Test Image")
+	if _, err := reg.RegisterImage("cirros-0.5.2", "cirros-0.5.2.img", "linux", "CirrOS 0.5.2 Minimal Cloud Test Image"); err != nil {
+		fmt.Printf("Failed to register sample CirrOS image: %v\n", err)
+		return
+	}
 
 	// Create sample example manifests
 	validYAML := fmt.Sprintf(`apiVersion: gdc.infrastructure.io/v1alpha1
@@ -180,7 +209,10 @@ spec:
     isolated: true
 `, uEntry.SHA256)
 
-	_ = os.WriteFile(filepath.Join("examples", "valid-ubuntu-vm.yaml"), []byte(validYAML), 0644)
+	if err := os.WriteFile(filepath.Join("examples", "valid-ubuntu-vm.yaml"), []byte(validYAML), 0644); err != nil {
+		fmt.Printf("Failed writing valid-ubuntu-vm.yaml: %v\n", err)
+		return
+	}
 
 	badAirGapYAML := `apiVersion: gdc.infrastructure.io/v1alpha1
 kind: VirtualMachine
@@ -196,7 +228,10 @@ spec:
     remoteUrl: "https://unauthorized-public-mirror.com/image.iso"
   restartPolicy: OnFailure
 `
-	_ = os.WriteFile(filepath.Join("examples", "airgap-violation.yaml"), []byte(badAirGapYAML), 0644)
+	if err := os.WriteFile(filepath.Join("examples", "airgap-violation.yaml"), []byte(badAirGapYAML), 0644); err != nil {
+		fmt.Printf("Failed writing airgap-violation.yaml: %v\n", err)
+		return
+	}
 
 	fmt.Println("[INIT] Air-gapped registry seeded with 2 offline images:")
 	fmt.Printf("       - ubuntu-22.04 (SHA256: %s)\n", uEntry.SHA256)
@@ -424,7 +459,10 @@ func cmdDelete(args []string) {
 	// Trigger graceful termination phase
 	vm.Status.Phase = v1alpha1.PhaseTerminating
 	vm.Status.Message = "Termination requested by user"
-	_ = s.Save(vm)
+	if err := s.Save(vm); err != nil {
+		fmt.Printf("Failed marking VM for termination: %v\n", err)
+		return
+	}
 	fmt.Printf("virtualmachine.gdc.infrastructure.io/%s marked for termination\n", name)
 }
 
@@ -491,7 +529,11 @@ func cmdSnapshot(args []string) {
 			fmt.Printf("Disk image '%s' not found in registry\n", vm.Spec.Image.Name)
 			return
 		}
-		sourceDisk := reg.GetImagePath(entry.Filename)
+		sourceDisk, err := reg.GetImagePath(entry.Filename)
+		if err != nil {
+			fmt.Printf("Failed getting disk path: %v\n", err)
+			return
+		}
 		meta, err := mgr.Create(vm, snapName, sourceDisk)
 		if err != nil {
 			fmt.Printf("Failed to create snapshot: %v\n", err)

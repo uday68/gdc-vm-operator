@@ -7,9 +7,11 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
+	"github.com/uday68/gdc-vm-operator/pkg/pathutil"
 	"gopkg.in/yaml.v3"
 )
 
@@ -40,18 +42,27 @@ type LocalRegistry struct {
 
 // NewLocalRegistry initializes a registry manager with a base directory.
 func NewLocalRegistry(baseDir string) (*LocalRegistry, error) {
-	if err := os.MkdirAll(baseDir, 0755); err != nil {
+	if strings.TrimSpace(baseDir) == "" {
+		return nil, fmt.Errorf("registry base directory cannot be empty")
+	}
+
+	cleanBase, err := filepath.Abs(filepath.Clean(baseDir))
+	if err != nil {
+		return nil, fmt.Errorf("invalid registry directory path: %w", err)
+	}
+
+	if err := os.MkdirAll(cleanBase, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create registry base directory: %w", err)
 	}
 
-	imagesDir := filepath.Join(baseDir, "images")
+	imagesDir := filepath.Join(cleanBase, "images")
 	if err := os.MkdirAll(imagesDir, 0755); err != nil {
 		return nil, fmt.Errorf("failed to create images directory: %w", err)
 	}
 
-	catalogPath := filepath.Join(baseDir, "catalog.yaml")
+	catalogPath := filepath.Join(cleanBase, "catalog.yaml")
 	reg := &LocalRegistry{
-		baseDir:     baseDir,
+		baseDir:     cleanBase,
 		catalogPath: catalogPath,
 		catalog: Catalog{
 			Version: "v1",
@@ -93,12 +104,55 @@ func (r *LocalRegistry) saveCatalogLocked() error {
 	if err != nil {
 		return fmt.Errorf("failed to marshal catalog: %w", err)
 	}
-	return os.WriteFile(r.catalogPath, data, 0644)
+
+	// Atomic catalog write via temporary file
+	tmpFile, err := os.CreateTemp(r.baseDir, ".tmp-catalog-*.yaml")
+	if err != nil {
+		return fmt.Errorf("failed creating temp catalog file: %w", err)
+	}
+	tmpPath := tmpFile.Name()
+
+	var success bool
+	defer func() {
+		if !success {
+			_ = tmpFile.Close()
+			_ = os.Remove(tmpPath)
+		}
+	}()
+
+	if _, err := tmpFile.Write(data); err != nil {
+		return fmt.Errorf("failed writing temp catalog: %w", err)
+	}
+	if err := tmpFile.Sync(); err != nil {
+		return fmt.Errorf("failed syncing temp catalog: %w", err)
+	}
+	if err := tmpFile.Close(); err != nil {
+		return fmt.Errorf("failed closing temp catalog: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, r.catalogPath); err != nil {
+		return fmt.Errorf("failed committing catalog file: %w", err)
+	}
+
+	success = true
+	return nil
 }
 
 // RegisterImage adds or updates an image in the air-gapped catalog and calculates its SHA256 checksum.
 func (r *LocalRegistry) RegisterImage(name, filename, osFamily, description string) (*CatalogEntry, error) {
-	filePath := filepath.Join(r.baseDir, "images", filename)
+	if err := pathutil.ValidateResourceName(name); err != nil {
+		return nil, fmt.Errorf("invalid image name: %w", err)
+	}
+	if err := pathutil.ValidateFilename(filename); err != nil {
+		return nil, fmt.Errorf("invalid image filename: %w", err)
+	}
+
+	imagesDir := filepath.Join(r.baseDir, "images")
+	filePath, err := pathutil.SafeJoin(imagesDir, filename)
+	if err != nil {
+		return nil, fmt.Errorf("unsafe image path: %w", err)
+	}
+
 	info, err := os.Stat(filePath)
 	if err != nil {
 		return nil, fmt.Errorf("image binary %s not found in registry path: %w", filename, err)
@@ -116,7 +170,7 @@ func (r *LocalRegistry) RegisterImage(name, filename, osFamily, description stri
 		SizeBytes:   info.Size(),
 		OSFamily:    osFamily,
 		Description: description,
-		AddedAt:     time.Now(),
+		AddedAt:     time.Now().UTC(),
 	}
 
 	r.mu.Lock()
@@ -152,12 +206,16 @@ func (r *LocalRegistry) ListImages() []CatalogEntry {
 	return list
 }
 
-// GetImagePath returns the full path on disk to the image.
-func (r *LocalRegistry) GetImagePath(filename string) string {
-	return filepath.Join(r.baseDir, "images", filename)
+// GetImagePath returns the safe full path on disk to the image.
+func (r *LocalRegistry) GetImagePath(filename string) (string, error) {
+	if err := pathutil.ValidateFilename(filename); err != nil {
+		return "", fmt.Errorf("invalid image filename: %w", err)
+	}
+	imagesDir := filepath.Join(r.baseDir, "images")
+	return pathutil.SafeJoin(imagesDir, filename)
 }
 
-// ComputeSHA256 calculates the SHA256 cryptographic hash of a file.
+// ComputeSHA256 calculates the SHA256 cryptographic hash of a file with streaming IO.
 func ComputeSHA256(filePath string) (string, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -172,4 +230,3 @@ func ComputeSHA256(filePath string) (string, error) {
 
 	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
-

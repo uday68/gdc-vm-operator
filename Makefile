@@ -1,4 +1,5 @@
 # Makefile for GDC Air-Gapped Virtual Machine Operator
+# Supported Go Version: 1.22+
 
 BINARY_DIR := bin
 RUNNER_BIN := $(BINARY_DIR)/vm-runner

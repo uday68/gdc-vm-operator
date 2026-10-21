@@ -1,13 +1,16 @@
 # GDC Air-Gapped Virtual Machine Operator (`gdc-vm-operator`)
 
 [![CI Pipeline](https://github.com/uday68/gdc-vm-operator/actions/workflows/ci.yml/badge.svg)](https://github.com/uday68/gdc-vm-operator/actions)
-[![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)](https://golang.org)
+[![Go Version](https://img.shields.io/badge/Go-1.22+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![Build & Test Status](https://img.shields.io/badge/Tests-100%25%20Passing-brightgreen)]()
 [![Architecture](https://img.shields.io/badge/Architecture-Kubernetes%20Operator-blue)]()
 [![Observability](https://img.shields.io/badge/Observability-Prometheus%20%2B%20Probes-orange)]()
 [![Security](https://img.shields.io/badge/Security-Air--Gapped%20Zero--Trust-red)]()
 
-A lightweight, production-grade **Air-Gapped Virtual Machine Lifecycle Operator and CLI in Go**, designed to mirror the architectural paradigms of **Google Distributed Cloud (GDC) Virtual Machine Infrastructure**.
+A lightweight, standalone **Air-Gapped Virtual Machine Lifecycle Operator and CLI in Go**, designed to illustrate the architectural patterns and reconciliation mechanics of **Google Distributed Cloud (GDC) Virtual Machine Infrastructure**.
+
+> **Note on Prototype Scope:**  
+> This project is an architectural prototype and educational reference implementation. It models Kubernetes declarative control loops, CRD state machines, offline artifact verification, and deterministic IPAM in pure Go without external cluster dependencies. Guest VM workloads are simulated via a managed runner process (`cmd/vm-runner`) to enable cross-platform execution and testing without requiring host hypervisor (KVM/QEMU) privileges or root access. It does not control bare-metal hypervisors and is not a certified production Kubernetes distribution.
 
 ---
 

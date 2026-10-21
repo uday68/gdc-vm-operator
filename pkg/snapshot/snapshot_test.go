@@ -75,3 +75,48 @@ func TestSnapshotManager_Lifecycle(t *testing.T) {
 	}
 }
 
+func TestSnapshotManager_PathTraversalRejection(t *testing.T) {
+	tempDir, err := os.MkdirTemp("", "gdc-snapshot-traversal-*")
+	if err != nil {
+		t.Fatalf("failed to create temp dir: %v", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	mgr, err := NewManager(tempDir)
+	if err != nil {
+		t.Fatalf("failed to init manager: %v", err)
+	}
+
+	dummyDisk := filepath.Join(tempDir, "disk.raw")
+	_ = os.WriteFile(dummyDisk, []byte("dummy"), 0644)
+
+	traversalVM := &v1alpha1.VirtualMachine{
+		Metadata: v1alpha1.ObjectMeta{Name: "../../escape-vm"},
+	}
+
+	// Traversal in VM name
+	if _, err := mgr.Create(traversalVM, "snap-1", dummyDisk); err == nil {
+		t.Fatalf("expected error creating snapshot with traversal VM name, got nil")
+	}
+
+	// Traversal in snapshot name
+	validVM := &v1alpha1.VirtualMachine{
+		Metadata: v1alpha1.ObjectMeta{Name: "valid-vm"},
+	}
+	if _, err := mgr.Create(validVM, "../../evil-snap", dummyDisk); err == nil {
+		t.Fatalf("expected error creating snapshot with traversal snapshot name, got nil")
+	}
+
+	// Traversal in Restore
+	if _, err := mgr.Restore("../../escape-vm", "snap-1", dummyDisk); err == nil {
+		t.Fatalf("expected error restoring traversal VM name, got nil")
+	}
+	if _, err := mgr.Restore("valid-vm", "../../evil-snap", dummyDisk); err == nil {
+		t.Fatalf("expected error restoring traversal snapshot name, got nil")
+	}
+
+	// Traversal in List
+	if _, err := mgr.List("../../escape-vm"); err == nil {
+		t.Fatalf("expected error listing traversal VM name, got nil")
+	}
+}

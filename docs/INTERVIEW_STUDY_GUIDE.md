@@ -2,7 +2,8 @@
 
 > **Target Role:** Google Distributed Cloud (GDC) – Virtual Machine Infrastructure Team (Air-Gapped)  
 > **Repository:** `github.com/uday68/gdc-vm-operator`  
-> **Key Technologies:** Go (Golang), Kubernetes Controller Architecture, Systems Virtualization, Air-Gapped Security, Distributed Systems Reconciliation.
+> **Key Technologies:** Go (Golang), Kubernetes Controller Architecture, Systems Virtualization, Air-Gapped Security, Distributed Systems Reconciliation.  
+> **Prototype Scope:** Standalone educational control plane prototype with simulated workload runner; does not control bare-metal hypervisors or require external Kubernetes clusters.
 
 ---
 
