@@ -50,18 +50,27 @@ func NewScheduler(totalVCPU, totalMemMB, totalDiskGB int) *Scheduler {
 }
 
 // CanSchedule checks if host node has sufficient capacity to run the requested VM.
+// If the VM already has a reservation, it checks whether updating to the new spec is possible.
 func (s *Scheduler) CanSchedule(vm *v1alpha1.VirtualMachine) (bool, string) {
+	if vm == nil {
+		return false, "vm cannot be nil"
+	}
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	// If VM already holds reservation, it is already admitted
-	if _, exists := s.reservations[vm.Metadata.Name]; exists {
-		return true, ""
-	}
-
+	req := vm.Spec.Resources
 	currentVCPU, currentMem, currentDisk := s.currentAllocationsLocked()
 
-	req := vm.Spec.Resources
+	// If VM already holds reservation, compute against the delta
+	if existing, exists := s.reservations[vm.Metadata.Name]; exists {
+		if existing.VCPU == req.VCPU && existing.MemoryMB == req.MemoryMB && existing.DiskGB == req.DiskGB {
+			return true, ""
+		}
+		currentVCPU -= existing.VCPU
+		currentMem -= existing.MemoryMB
+		currentDisk -= existing.DiskGB
+	}
+
 	if currentVCPU+req.VCPU > s.totalVCPU {
 		return false, fmt.Sprintf("insufficient vCPU: requested %d, available %d (node total %d)",
 			req.VCPU, s.totalVCPU-currentVCPU, s.totalVCPU)
@@ -80,26 +89,71 @@ func (s *Scheduler) CanSchedule(vm *v1alpha1.VirtualMachine) (bool, string) {
 	return true, ""
 }
 
-// Reserve allocates node capacity for the VM.
+// Reserve allocates node capacity for the VM or safely updates an existing reservation.
+// It is idempotent if the resource requirements have not changed.
+// If requirements changed, it verifies that the node can accommodate the delta.
+// If the delta exceeds capacity, it fails with an error and retains the previous reservation.
 func (s *Scheduler) Reserve(vm *v1alpha1.VirtualMachine) error {
+	if vm == nil {
+		return fmt.Errorf("vm cannot be nil")
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if _, exists := s.reservations[vm.Metadata.Name]; exists {
+	req := vm.Spec.Resources
+	existing, exists := s.reservations[vm.Metadata.Name]
+	if exists {
+		if existing.VCPU == req.VCPU && existing.MemoryMB == req.MemoryMB && existing.DiskGB == req.DiskGB {
+			// Idempotent: exact same requirements already reserved
+			return nil
+		}
+
+		// Calculate allocations excluding the current VM's reservation
+		currentVCPU, currentMem, currentDisk := s.currentAllocationsLocked()
+		baseVCPU := currentVCPU - existing.VCPU
+		baseMem := currentMem - existing.MemoryMB
+		baseDisk := currentDisk - existing.DiskGB
+
+		if baseVCPU+req.VCPU > s.totalVCPU ||
+			baseMem+req.MemoryMB > s.totalMemMB ||
+			baseDisk+req.DiskGB > s.totalDiskGB {
+			return fmt.Errorf("insufficient node capacity to update reservation for %s (requested: vCPU %d, RAM %dMB, Disk %dGB; available: vCPU %d, RAM %dMB, Disk %dGB)",
+				vm.Metadata.Name, req.VCPU, req.MemoryMB, req.DiskGB,
+				s.totalVCPU-baseVCPU, s.totalMemMB-baseMem, s.totalDiskGB-baseDisk)
+		}
+
+		s.reservations[vm.Metadata.Name] = req
 		return nil
 	}
 
 	currentVCPU, currentMem, currentDisk := s.currentAllocationsLocked()
-	req := vm.Spec.Resources
-
 	if currentVCPU+req.VCPU > s.totalVCPU ||
 		currentMem+req.MemoryMB > s.totalMemMB ||
 		currentDisk+req.DiskGB > s.totalDiskGB {
-		return fmt.Errorf("insufficient node capacity to reserve resources for %s", vm.Metadata.Name)
+		return fmt.Errorf("insufficient node capacity to reserve resources for %s (requested: vCPU %d, RAM %dMB, Disk %dGB; available: vCPU %d, RAM %dMB, Disk %dGB)",
+			vm.Metadata.Name, req.VCPU, req.MemoryMB, req.DiskGB,
+			s.totalVCPU-currentVCPU, s.totalMemMB-currentMem, s.totalDiskGB-currentDisk)
 	}
 
 	s.reservations[vm.Metadata.Name] = req
 	return nil
+}
+
+// GetReservation returns the current reservation for a VM, if one exists.
+func (s *Scheduler) GetReservation(vmName string) (v1alpha1.ResourceRequirements, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res, exists := s.reservations[vmName]
+	return res, exists
+}
+
+// HasReservation checks if a VM holds an active reservation.
+func (s *Scheduler) HasReservation(vmName string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	_, exists := s.reservations[vmName]
+	return exists
 }
 
 // Release frees node capacity when a VM terminates.

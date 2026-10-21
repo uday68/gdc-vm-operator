@@ -96,6 +96,7 @@ func (s *FileStore) recoverFromDisk() error {
 }
 
 // Save persists the VM spec and status atomically to disk and updates in-memory cache.
+// Slow serialization and temp file disk I/O are performed outside the store lock.
 func (s *FileStore) Save(vm *v1alpha1.VirtualMachine) error {
 	if vm == nil {
 		return fmt.Errorf("cannot save nil virtual machine")
@@ -103,9 +104,6 @@ func (s *FileStore) Save(vm *v1alpha1.VirtualMachine) error {
 	if err := pathutil.ValidateResourceName(vm.Metadata.Name); err != nil {
 		return fmt.Errorf("invalid VM metadata.name: %w", err)
 	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
 
 	cloned := vm.DeepCopy()
 
@@ -119,7 +117,7 @@ func (s *FileStore) Save(vm *v1alpha1.VirtualMachine) error {
 		return fmt.Errorf("failed to marshal VM manifest: %w", err)
 	}
 
-	// 1. Write to unique temporary file in base directory
+	// 1. Write to unique temporary file in base directory (outside store lock)
 	tmpFile, err := os.CreateTemp(s.baseDir, fmt.Sprintf(".tmp-%s-*.yaml", vm.Metadata.Name))
 	if err != nil {
 		return fmt.Errorf("failed creating temporary state file: %w", err)
@@ -148,15 +146,16 @@ func (s *FileStore) Save(vm *v1alpha1.VirtualMachine) error {
 		return fmt.Errorf("failed closing temp state file: %w", err)
 	}
 
-	// 2. Safe atomic replacement with retry (handles platform sharing locks)
+	// 2. Safe atomic replacement and in-memory cache commit under short lock
+	s.mu.Lock()
 	if err := safeReplaceFile(tmpPath, targetPath); err != nil {
+		s.mu.Unlock()
 		return fmt.Errorf("failed committing state file atomically: %w", err)
 	}
+	s.cache[vm.Metadata.Name] = cloned
+	s.mu.Unlock()
 
 	success = true
-
-	// 3. Update cache only after successful disk commit
-	s.cache[vm.Metadata.Name] = cloned
 	return nil
 }
 

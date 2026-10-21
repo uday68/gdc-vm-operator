@@ -70,13 +70,14 @@ func (r *ExponentialFailureRateLimiter) NumRequeues(item string) int {
 
 // Queue provides a thread-safe, deduplicating workqueue for controller events.
 type Queue struct {
-	queue       []string
-	dirty       map[string]struct{} // items scheduled or waiting
-	processing  map[string]struct{} // items currently being reconciled
-	cond        *sync.Cond
+	queue        []string
+	dirty        map[string]struct{} // items scheduled or waiting
+	processing   map[string]struct{} // items currently being reconciled
+	cond         *sync.Cond
 	shuttingDown bool
-	rateLimiter RateLimiter
-	mu          sync.Mutex
+	stopCh       chan struct{}
+	rateLimiter  RateLimiter
+	mu           sync.Mutex
 }
 
 // NewQueue constructs a Kubernetes-style deduplicating workqueue with rate limiting.
@@ -87,6 +88,7 @@ func NewQueue(limiter RateLimiter) *Queue {
 	q := &Queue{
 		dirty:       make(map[string]struct{}),
 		processing:  make(map[string]struct{}),
+		stopCh:      make(chan struct{}),
 		rateLimiter: limiter,
 	}
 	q.cond = sync.NewCond(&q.mu)
@@ -116,11 +118,26 @@ func (q *Queue) Add(item string) {
 }
 
 // AddRateLimited schedules an item after an exponential backoff delay.
+// Pending delay timers are cleanly cancelled if the queue shuts down, preventing leaks.
 func (q *Queue) AddRateLimited(item string) time.Duration {
+	q.mu.Lock()
+	if q.shuttingDown {
+		q.mu.Unlock()
+		return 0
+	}
 	delay := q.rateLimiter.When(item)
+	stopCh := q.stopCh
+	q.mu.Unlock()
+
 	go func() {
-		time.Sleep(delay)
-		q.Add(item)
+		timer := time.NewTimer(delay)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			q.Add(item)
+		case <-stopCh:
+			return
+		}
 	}()
 	return delay
 }
@@ -168,13 +185,24 @@ func (q *Queue) Done(item string) {
 	}
 }
 
-// ShutDown signals the queue to stop accepting new work.
+// ShutDown signals the queue to stop accepting new work and releases waiting goroutines and timers.
 func (q *Queue) ShutDown() {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 
+	if q.shuttingDown {
+		return
+	}
 	q.shuttingDown = true
+	close(q.stopCh)
 	q.cond.Broadcast()
+}
+
+// IsShuttingDown checks if the workqueue is closed.
+func (q *Queue) IsShuttingDown() bool {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	return q.shuttingDown
 }
 
 // Len returns current number of items waiting in queue.

@@ -127,6 +127,16 @@ func (vm *VirtualMachine) SetCondition(condType string, status ConditionStatus, 
 	})
 }
 
+// GetCondition returns the condition with the specified type, or nil if not found.
+func (vm *VirtualMachine) GetCondition(condType string) *VMCondition {
+	for i := range vm.Status.Conditions {
+		if vm.Status.Conditions[i].Type == condType {
+			return &vm.Status.Conditions[i]
+		}
+	}
+	return nil
+}
+
 
 // DeepCopy returns an independent, thread-safe deep copy of the VirtualMachine.
 func (vm *VirtualMachine) DeepCopy() *VirtualMachine {

@@ -58,3 +58,46 @@ func TestIPAM_Lifecycle(t *testing.T) {
 	}
 }
 
+func TestIPAM_ReserveIPAndConflictDetection(t *testing.T) {
+	allocator, err := NewIPAM("10.244.1.0/29")
+	if err != nil {
+		t.Fatalf("failed to create IPAM: %v", err)
+	}
+
+	// 1. Valid specific IP reservation
+	if err := allocator.ReserveIP("vm-alpha", "10.244.1.5"); err != nil {
+		t.Fatalf("failed to reserve valid IP: %v", err)
+	}
+	ip, exists := allocator.GetAllocatedIP("vm-alpha")
+	if !exists || ip != "10.244.1.5" {
+		t.Fatalf("expected 10.244.1.5 to be assigned, got: %s (exists=%v)", ip, exists)
+	}
+
+	// 2. Idempotent reservation for same VM
+	if err := allocator.ReserveIP("vm-alpha", "10.244.1.5"); err != nil {
+		t.Fatalf("expected idempotent reservation to succeed, got: %v", err)
+	}
+
+	// 3. Conflict detection: vm-beta attempts to claim vm-alpha's IP
+	if err := allocator.ReserveIP("vm-beta", "10.244.1.5"); err == nil {
+		t.Fatalf("expected conflict error when vm-beta claims allocated IP, got nil")
+	}
+
+	// 4. Reject network, gateway, and broadcast IPs
+	if err := allocator.ReserveIP("vm-bad", "10.244.1.0"); err == nil {
+		t.Fatalf("expected error allocating network IP .0, got nil")
+	}
+	if err := allocator.ReserveIP("vm-bad", "10.244.1.1"); err == nil {
+		t.Fatalf("expected error allocating gateway IP .1, got nil")
+	}
+	if err := allocator.ReserveIP("vm-bad", "10.244.1.7"); err == nil {
+		t.Fatalf("expected error allocating broadcast IP .7, got nil")
+	}
+
+	// 5. Reject IP outside subnet
+	if err := allocator.ReserveIP("vm-bad", "192.168.1.100"); err == nil {
+		t.Fatalf("expected error allocating out-of-subnet IP, got nil")
+	}
+}
+
+

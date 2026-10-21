@@ -19,6 +19,8 @@ func main() {
 	vcpu := flag.Int("vcpu", 1, "Number of vCPUs")
 	memoryMB := flag.Int("memory-mb", 512, "Memory in MB")
 	diskPath := flag.String("disk-path", "/dev/null", "Path to disk image")
+	exitAfter := flag.Duration("exit-after", 0, "Simulated runtime duration before automatic exit (0 = run indefinitely)")
+	exitCode := flag.Int("exit-code", 0, "Exit code to return when exiting via --exit-after (0 = clean, >0 = failure)")
 	flag.Parse()
 
 	ipLastOctet := 10 + rand.Intn(200)
@@ -37,6 +39,11 @@ func main() {
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
 
+	var exitTimer <-chan time.Time
+	if *exitAfter > 0 {
+		exitTimer = time.After(*exitAfter)
+	}
+
 	for {
 		select {
 		case sig := <-sigChan:
@@ -44,6 +51,13 @@ func main() {
 			time.Sleep(200 * time.Millisecond)
 			fmt.Println("[SHUTDOWN] VM terminated cleanly.")
 			os.Exit(0)
+		case <-exitTimer:
+			if *exitCode == 0 {
+				fmt.Printf("[COMPLETE] Workload completed successfully after %s, exiting with code 0\n", *exitAfter)
+			} else {
+				fmt.Printf("[CRASH] Simulated process crash after %s, exiting with code %d\n", *exitAfter, *exitCode)
+			}
+			os.Exit(*exitCode)
 		case <-ticker.C:
 			uptime := time.Since(startTime).Truncate(time.Second)
 			fmt.Printf("[HEARTBEAT] VM '%s' status=HEALTHY, uptime=%s\n", *name, uptime)

@@ -19,6 +19,7 @@ type VMRuntime interface {
 	Start(ctx context.Context, vm *v1alpha1.VirtualMachine, imagePath string) (int, error)
 	Stop(pid int) error
 	IsAlive(pid int) bool
+	GetExitCode(vmName string) (int, bool)
 	GetLogs(vmName string) (string, error)
 }
 
@@ -27,6 +28,8 @@ type VMRuntime interface {
 type ProcessVMRuntime struct {
 	logsDir   string
 	runnerBin string
+	processes map[string]*exec.Cmd
+	exitCodes map[string]int
 	mu        sync.RWMutex
 }
 
@@ -43,10 +46,13 @@ func NewProcessVMRuntime(logsDir, runnerBin string) (*ProcessVMRuntime, error) {
 	return &ProcessVMRuntime{
 		logsDir:   logsDir,
 		runnerBin: runnerBin,
+		processes: make(map[string]*exec.Cmd),
+		exitCodes: make(map[string]int),
 	}, nil
 }
 
 // Start launches a new simulated VM process and redirects stdout/stderr to a log file.
+// Broad locks are avoided: filesystem checks and process startup occur outside critical sections.
 func (r *ProcessVMRuntime) Start(ctx context.Context, vm *v1alpha1.VirtualMachine, imagePath string) (int, error) {
 	if vm == nil {
 		return 0, fmt.Errorf("virtual machine manifest cannot be nil")
@@ -55,10 +61,7 @@ func (r *ProcessVMRuntime) Start(ctx context.Context, vm *v1alpha1.VirtualMachin
 		return 0, fmt.Errorf("invalid VM name for runtime: %w", err)
 	}
 
-	r.mu.Lock()
-	defer r.mu.Unlock()
-
-	// Verify disk image artifact exists on host filesystem before launching workload
+	// Verify disk image artifact exists on host filesystem before launching workload (lock-free)
 	if _, err := os.Stat(imagePath); err != nil {
 		return 0, fmt.Errorf("disk image '%s' is inaccessible or does not exist: %w", imagePath, err)
 	}
@@ -73,12 +76,28 @@ func (r *ProcessVMRuntime) Start(ctx context.Context, vm *v1alpha1.VirtualMachin
 		return 0, fmt.Errorf("failed to open VM log file: %w", err)
 	}
 
+	// Clean up previous exit status file if exists
+	exitFilePath, _ := pathutil.SafeJoin(r.logsDir, fmt.Sprintf("%s.exit", vm.Metadata.Name))
+	if exitFilePath != "" {
+		_ = os.Remove(exitFilePath)
+	}
+
 	// Prepare simulation process arguments
 	args := []string{
 		"--name", vm.Metadata.Name,
 		"--vcpu", strconv.Itoa(vm.Spec.Resources.VCPU),
 		"--memory-mb", strconv.Itoa(vm.Spec.Resources.MemoryMB),
 		"--disk-path", imagePath,
+	}
+
+	// Optional simulation control overrides via metadata labels for failure injection
+	if vm.Metadata.Labels != nil {
+		if exitAfter, ok := vm.Metadata.Labels["simulation.exit-after"]; ok && exitAfter != "" {
+			args = append(args, "--exit-after", exitAfter)
+		}
+		if exitCode, ok := vm.Metadata.Labels["simulation.exit-code"]; ok && exitCode != "" {
+			args = append(args, "--exit-code", exitCode)
+		}
 	}
 
 	var cmd *exec.Cmd
@@ -117,7 +136,62 @@ func (r *ProcessVMRuntime) Start(ctx context.Context, vm *v1alpha1.VirtualMachin
 		return pid, fmt.Errorf("failed closing log file: %w", err)
 	}
 
+	// Record running process in internal map under short lock
+	r.mu.Lock()
+	r.processes[vm.Metadata.Name] = cmd
+	delete(r.exitCodes, vm.Metadata.Name)
+	r.mu.Unlock()
+
+	// Launch background monitor to capture exit status without blocking
+	go func(runningCmd *exec.Cmd, vmName, exitPath string) {
+		waitErr := runningCmd.Wait()
+		code := 0
+		if waitErr != nil {
+			if exitErr, ok := waitErr.(*exec.ExitError); ok {
+				code = exitErr.ExitCode()
+			} else {
+				code = 1
+			}
+		}
+
+		r.mu.Lock()
+		r.exitCodes[vmName] = code
+		delete(r.processes, vmName)
+		r.mu.Unlock()
+
+		if exitPath != "" {
+			_ = os.WriteFile(exitPath, []byte(strconv.Itoa(code)), 0644)
+		}
+	}(cmd, vm.Metadata.Name, exitFilePath)
+
 	return pid, nil
+}
+
+// GetExitCode retrieves the process exit code for a terminated VM, reading from disk if needed across restarts.
+func (r *ProcessVMRuntime) GetExitCode(vmName string) (int, bool) {
+	r.mu.RLock()
+	code, ok := r.exitCodes[vmName]
+	r.mu.RUnlock()
+	if ok {
+		return code, true
+	}
+
+	// Check durable .exit file on disk (written upon process termination)
+	exitFilePath, err := pathutil.SafeJoin(r.logsDir, fmt.Sprintf("%s.exit", vmName))
+	if err == nil {
+		data, err := os.ReadFile(exitFilePath)
+		if err == nil {
+			parsed, err := strconv.Atoi(strings.TrimSpace(string(data)))
+			if err == nil {
+				r.mu.Lock()
+				r.exitCodes[vmName] = parsed
+				r.mu.Unlock()
+				return parsed, true
+			}
+		}
+	}
+
+	return 0, false
 }
 
 // Stop gracefully terminates a simulated VM process, falling back to force kill.

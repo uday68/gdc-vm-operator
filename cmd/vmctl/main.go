@@ -132,7 +132,7 @@ func getComponents() (store.Store, *registry.LocalRegistry, *validator.Validator
 				fmt.Printf("Warning: failed to restore scheduler reservation for VM %s: %v\n", vm.Metadata.Name, err)
 			}
 			if vm.Status.AllocatedIP != "" {
-				if _, err := ipamMgr.Allocate(vm.Metadata.Name); err != nil {
+				if err := ipamMgr.ReserveIP(vm.Metadata.Name, vm.Status.AllocatedIP); err != nil {
 					fmt.Printf("Warning: failed to restore IPAM allocation for VM %s: %v\n", vm.Metadata.Name, err)
 				}
 			}

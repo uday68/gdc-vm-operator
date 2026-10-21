@@ -51,3 +51,61 @@ func TestScheduler_CapacityAdmissionAndRelease(t *testing.T) {
 	}
 }
 
+func TestScheduler_IdempotencyAndSpecUpdates(t *testing.T) {
+	// Node capacity: 8 vCPUs, 16384 MB RAM, 500 GB Disk
+	sched := NewScheduler(8, 16384, 500)
+
+	vm := &v1alpha1.VirtualMachine{
+		Metadata: v1alpha1.ObjectMeta{Name: "worker-node"},
+		Spec: v1alpha1.VirtualMachineSpec{
+			Resources: v1alpha1.ResourceRequirements{VCPU: 4, MemoryMB: 8192, DiskGB: 100},
+		},
+	}
+
+	// 1. Initial reservation
+	if err := sched.Reserve(vm); err != nil {
+		t.Fatalf("initial reservation failed: %v", err)
+	}
+	cap := sched.CapacityReport()
+	if cap.AllocatedVCPU != 4 || cap.AvailableVCPU != 4 {
+		t.Fatalf("expected 4 vCPU allocated, got: %d", cap.AllocatedVCPU)
+	}
+
+	// 2. Repeated reservation must be idempotent (no double allocation)
+	if err := sched.Reserve(vm); err != nil {
+		t.Fatalf("repeated reservation failed: %v", err)
+	}
+	cap = sched.CapacityReport()
+	if cap.AllocatedVCPU != 4 {
+		t.Fatalf("double allocation detected! expected 4 vCPU allocated, got: %d", cap.AllocatedVCPU)
+	}
+
+	// 3. Valid spec update: increase from 4 to 6 vCPUs (within 8 vCPU limit)
+	vm.Spec.Resources.VCPU = 6
+	if err := sched.Reserve(vm); err != nil {
+		t.Fatalf("expected valid spec update to succeed, got: %v", err)
+	}
+	cap = sched.CapacityReport()
+	if cap.AllocatedVCPU != 6 || cap.AvailableVCPU != 2 {
+		t.Fatalf("expected 6 vCPU allocated after update, got: %d", cap.AllocatedVCPU)
+	}
+
+	// 4. Invalid spec update: increase from 6 to 12 vCPUs (exceeds node 8 vCPU total)
+	vm.Spec.Resources.VCPU = 12
+	err := sched.Reserve(vm)
+	if err == nil {
+		t.Fatalf("expected overcommit update to fail, but succeeded")
+	}
+
+	// 5. Verify the previous valid reservation (6 vCPUs) was NOT lost
+	cap = sched.CapacityReport()
+	if cap.AllocatedVCPU != 6 {
+		t.Fatalf("previous reservation lost on failed update! expected 6 vCPU, got: %d", cap.AllocatedVCPU)
+	}
+	res, found := sched.GetReservation("worker-node")
+	if !found || res.VCPU != 6 {
+		t.Fatalf("expected preserved reservation of 6 vCPUs, got: %+v", res)
+	}
+}
+
+

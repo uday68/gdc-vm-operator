@@ -65,6 +65,11 @@ func NewController(
 
 // Start initiates the reconciliation control loop.
 func (c *Controller) Start(ctx context.Context) {
+	// Reconcile and reconstruct state on startup before entering loop
+	if err := c.ReconcileRecoveredState(ctx); err != nil {
+		slog.Error("Failed reconciling recovered state on startup", "error", err)
+	}
+
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
@@ -92,12 +97,92 @@ func (c *Controller) Stop() {
 	}
 }
 
+// RuntimeObservation captures live facts discovered dynamically during reconciliation.
+type RuntimeObservation struct {
+	ProcessAlive     bool
+	ExitCode         int
+	ExitCodeKnown    bool
+	ImageExists      bool
+	ImagePath        string
+	CapacityReserved bool
+	IPAllocated      bool
+	AllocatedIP      string
+}
+
+// Observe performs read-only live runtime discovery without taking mutative action.
+func (c *Controller) Observe(ctx context.Context, vm *v1alpha1.VirtualMachine) *RuntimeObservation {
+	obs := &RuntimeObservation{}
+	if vm.Status.PID > 0 {
+		obs.ProcessAlive = c.runtime.IsAlive(vm.Status.PID)
+		if !obs.ProcessAlive {
+			obs.ExitCode, obs.ExitCodeKnown = c.runtime.GetExitCode(vm.Metadata.Name)
+		}
+	}
+	if entry, found := c.registry.GetImage(vm.Spec.Image.Name); found {
+		obs.ImageExists = true
+		obs.ImagePath, _ = c.registry.GetImagePath(entry.Filename)
+	}
+	obs.CapacityReserved = c.scheduler.HasReservation(vm.Metadata.Name)
+	obs.AllocatedIP, obs.IPAllocated = c.ipam.GetAllocatedIP(vm.Metadata.Name)
+	return obs
+}
+
+// ReconcileRecoveredState reconstructs scheduler reservations and IP allocations from persisted state.
+// Inconsistencies (e.g. overcapacity or IP conflicts) are detected and surfaced as actionable conditions.
+func (c *Controller) ReconcileRecoveredState(ctx context.Context) error {
+	vms := c.store.List()
+	for _, vm := range vms {
+		switch vm.Status.Phase {
+		case v1alpha1.PhaseRunning, v1alpha1.PhaseProvisioning:
+			processAlive := vm.Status.PID > 0 && c.runtime.IsAlive(vm.Status.PID)
+
+			// 1. Reconstruct scheduler reservation
+			if err := c.scheduler.Reserve(vm); err != nil {
+				slog.Error("Recovery: host capacity overcommit detected for VM", "name", vm.Metadata.Name, "error", err)
+				vm.Status.Phase = v1alpha1.PhaseDegraded
+				vm.SetCondition("Scheduled", v1alpha1.ConditionFalse, "RecoveryCapacityExceeded", err.Error())
+				vm.Status.Message = fmt.Sprintf("Recovery failed: %v", err)
+				vm.Status.LastTransitionTime = time.Now().UTC()
+				_ = c.store.Save(vm)
+				continue
+			}
+
+			// 2. Reconstruct IP allocation
+			if vm.Status.AllocatedIP != "" {
+				if err := c.ipam.ReserveIP(vm.Metadata.Name, vm.Status.AllocatedIP); err != nil {
+					slog.Error("Recovery: IP allocation conflict detected for VM", "name", vm.Metadata.Name, "ip", vm.Status.AllocatedIP, "error", err)
+					c.scheduler.Release(vm.Metadata.Name)
+					vm.Status.Phase = v1alpha1.PhaseDegraded
+					vm.SetCondition("NetworkReady", v1alpha1.ConditionFalse, "IPConflictDetected", err.Error())
+					vm.Status.Message = fmt.Sprintf("Recovery IP conflict: %v", err)
+					vm.Status.LastTransitionTime = time.Now().UTC()
+					_ = c.store.Save(vm)
+					continue
+				}
+			}
+
+			// 3. Check process health
+			if vm.Status.Phase == v1alpha1.PhaseRunning && !processAlive {
+				vm.SetCondition("Ready", v1alpha1.ConditionFalse, "ProcessTerminatedWhileOffline", "Guest process was not running on controller startup")
+				_ = c.store.Save(vm)
+			}
+
+		case v1alpha1.PhaseFailed, v1alpha1.PhaseStopped:
+			// Guarantee terminal phases hold no reservations
+			c.unwindResources(vm.Metadata.Name)
+
+		case v1alpha1.PhaseTerminating:
+			_ = c.handleTerminating(ctx, vm)
+		}
+	}
+	return nil
+}
+
 // ReconcileAll runs one reconciliation pass across all registered VM resources.
 func (c *Controller) ReconcileAll(ctx context.Context) {
 	vms := c.store.List()
 	for _, vm := range vms {
 		if err := c.ReconcileOne(ctx, vm); err != nil {
-			// Structured log without halting peer reconciliation
 			slog.Error("Failed reconciling virtual machine", "name", vm.Metadata.Name, "error", err)
 		}
 	}
@@ -105,15 +190,17 @@ func (c *Controller) ReconcileAll(ctx context.Context) {
 
 // ReconcileOne executes the core state machine for a single VirtualMachine resource.
 func (c *Controller) ReconcileOne(ctx context.Context, vm *v1alpha1.VirtualMachine) error {
+	obs := c.Observe(ctx, vm)
+
 	switch vm.Status.Phase {
 	case "", v1alpha1.PhasePending, v1alpha1.PhaseValidating:
 		return c.handleValidation(vm)
 
 	case v1alpha1.PhaseProvisioning:
-		return c.handleProvisioning(ctx, vm)
+		return c.handleProvisioning(ctx, vm, obs)
 
 	case v1alpha1.PhaseRunning:
-		return c.handleRunningHealth(ctx, vm)
+		return c.handleRunningHealth(ctx, vm, obs)
 
 	case v1alpha1.PhaseTerminating:
 		return c.handleTerminating(ctx, vm)
@@ -176,9 +263,8 @@ func (c *Controller) handleValidation(vm *v1alpha1.VirtualMachine) error {
 	return c.store.Save(vm)
 }
 
-func (c *Controller) handleProvisioning(ctx context.Context, vm *v1alpha1.VirtualMachine) error {
-	entry, found := c.registry.GetImage(vm.Spec.Image.Name)
-	if !found {
+func (c *Controller) handleProvisioning(ctx context.Context, vm *v1alpha1.VirtualMachine, obs *RuntimeObservation) error {
+	if !obs.ImageExists {
 		c.unwindResources(vm.Metadata.Name)
 		vm.Status.Phase = v1alpha1.PhaseFailed
 		vm.Status.Message = fmt.Sprintf("Image %s not found in registry catalog", vm.Spec.Image.Name)
@@ -187,8 +273,27 @@ func (c *Controller) handleProvisioning(ctx context.Context, vm *v1alpha1.Virtua
 		return c.store.Save(vm)
 	}
 
+	if obs.ImagePath == "" {
+		c.unwindResources(vm.Metadata.Name)
+		vm.Status.Phase = v1alpha1.PhaseFailed
+		vm.Status.Message = "Unsafe image path"
+		vm.Status.LastTransitionTime = time.Now().UTC()
+		vm.SetCondition("Provisioned", v1alpha1.ConditionFalse, "UnsafeImagePath", vm.Status.Message)
+		return c.store.Save(vm)
+	}
+
 	// Deterministic IP Allocation via Subnet IPAM
-	ip, err := c.ipam.Allocate(vm.Metadata.Name)
+	var ip string
+	var err error
+	if vm.Status.AllocatedIP != "" {
+		if err = c.ipam.ReserveIP(vm.Metadata.Name, vm.Status.AllocatedIP); err == nil {
+			ip = vm.Status.AllocatedIP
+		}
+	}
+	if ip == "" {
+		ip, err = c.ipam.Allocate(vm.Metadata.Name)
+	}
+
 	if err != nil {
 		vm.Status.Phase = v1alpha1.PhaseProvisioning
 		vm.Status.Message = fmt.Sprintf("Network allocation paused: %v", err)
@@ -197,21 +302,12 @@ func (c *Controller) handleProvisioning(ctx context.Context, vm *v1alpha1.Virtua
 		return c.store.Save(vm)
 	}
 
-	imagePath, err := c.registry.GetImagePath(entry.Filename)
-	if err != nil {
-		c.unwindResources(vm.Metadata.Name)
-		vm.Status.Phase = v1alpha1.PhaseFailed
-		vm.Status.Message = fmt.Sprintf("Unsafe image path: %v", err)
-		vm.Status.LastTransitionTime = time.Now().UTC()
-		vm.SetCondition("Provisioned", v1alpha1.ConditionFalse, "UnsafeImagePath", err.Error())
-		return c.store.Save(vm)
-	}
-
-	pid, err := c.runtime.Start(ctx, vm, imagePath)
+	pid, err := c.runtime.Start(ctx, vm, obs.ImagePath)
 	if err != nil {
 		c.unwindResources(vm.Metadata.Name)
 		vm.Status.Phase = v1alpha1.PhaseFailed
 		vm.Status.AllocatedIP = ""
+		vm.Status.PID = 0
 		vm.Status.Message = fmt.Sprintf("Runtime process start failed: %v", err)
 		vm.Status.LastTransitionTime = time.Now().UTC()
 		vm.SetCondition("Ready", v1alpha1.ConditionFalse, "RuntimeStartError", err.Error())
@@ -228,35 +324,72 @@ func (c *Controller) handleProvisioning(ctx context.Context, vm *v1alpha1.Virtua
 	return c.store.Save(vm)
 }
 
-func (c *Controller) handleRunningHealth(ctx context.Context, vm *v1alpha1.VirtualMachine) error {
-	// Inspect if process is still active
-	if c.runtime.IsAlive(vm.Status.PID) {
-		// VM is healthy
+func (c *Controller) handleRunningHealth(ctx context.Context, vm *v1alpha1.VirtualMachine, obs *RuntimeObservation) error {
+	// 1. Check if spec resources were modified while running
+	if currentRes, hasRes := c.scheduler.GetReservation(vm.Metadata.Name); hasRes {
+		req := vm.Spec.Resources
+		if currentRes.VCPU != req.VCPU || currentRes.MemoryMB != req.MemoryMB || currentRes.DiskGB != req.DiskGB {
+			if err := c.scheduler.Reserve(vm); err != nil {
+				vm.SetCondition("Scheduled", v1alpha1.ConditionFalse, "SpecUpdateFailed", err.Error())
+				_ = c.store.Save(vm)
+			} else {
+				vm.SetCondition("Scheduled", v1alpha1.ConditionTrue, "SpecUpdateApplied", "Resource reservation updated to match spec")
+				_ = c.store.Save(vm)
+			}
+		}
+	}
+
+	// 2. Inspect if process is still active
+	if obs.ProcessAlive {
 		return nil
 	}
 
-	// Process died! Self-healing reconciliation triggered.
-	slog.Warn("Process crash detected, triggering self-healing recovery",
-		"vm", vm.Metadata.Name,
-		"crashedPID", vm.Status.PID,
-		"previousRestarts", vm.Status.RestartCount,
-	)
-
+	// 3. Process is dead. Analyze exit status and restart policy.
 	policy := vm.Spec.RestartPolicy
 	if policy == "" {
 		policy = v1alpha1.RestartPolicyAlways
 	}
 
+	isCleanExit := obs.ExitCodeKnown && obs.ExitCode == 0
+
+	slog.Warn("Process termination observed",
+		"vm", vm.Metadata.Name,
+		"crashedPID", vm.Status.PID,
+		"exitCode", obs.ExitCode,
+		"exitCodeKnown", obs.ExitCodeKnown,
+		"policy", policy,
+	)
+
+	// Policy: Never
 	if policy == v1alpha1.RestartPolicyNever {
 		c.unwindResources(vm.Metadata.Name)
-		vm.Status.Phase = v1alpha1.PhaseStopped
-		vm.Status.Message = "Process exited, RestartPolicy is Never"
-		vm.Status.LastTransitionTime = time.Now().UTC()
-		vm.SetCondition("Ready", v1alpha1.ConditionFalse, "ProcessExited", vm.Status.Message)
+		vm.Status.PID = 0
+		if isCleanExit {
+			vm.Status.Phase = v1alpha1.PhaseStopped
+			vm.Status.Message = "Workload completed cleanly (RestartPolicy: Never)"
+			vm.Status.LastTransitionTime = time.Now().UTC()
+			vm.SetCondition("Ready", v1alpha1.ConditionFalse, "Completed", vm.Status.Message)
+		} else {
+			vm.Status.Phase = v1alpha1.PhaseFailed
+			vm.Status.Message = fmt.Sprintf("Workload crashed with exit code %d (RestartPolicy: Never)", obs.ExitCode)
+			vm.Status.LastTransitionTime = time.Now().UTC()
+			vm.SetCondition("Ready", v1alpha1.ConditionFalse, "CrashNonZeroExit", vm.Status.Message)
+		}
 		return c.store.Save(vm)
 	}
 
-	// Check restart threshold
+	// Policy: OnFailure with clean exit
+	if policy == v1alpha1.RestartPolicyOnFailure && isCleanExit {
+		c.unwindResources(vm.Metadata.Name)
+		vm.Status.PID = 0
+		vm.Status.Phase = v1alpha1.PhaseStopped
+		vm.Status.Message = "Workload completed cleanly (RestartPolicy: OnFailure)"
+		vm.Status.LastTransitionTime = time.Now().UTC()
+		vm.SetCondition("Ready", v1alpha1.ConditionFalse, "Completed", vm.Status.Message)
+		return c.store.Save(vm)
+	}
+
+	// For Always, or OnFailure with non-zero exit: self-healing restart
 	if vm.Status.RestartCount >= MaxCrashRestarts {
 		vm.Status.Phase = v1alpha1.PhaseDegraded
 		vm.Status.Message = fmt.Sprintf("Max restart attempts (%d) exceeded. Marked as Degraded (CrashLoopBackoff)", MaxCrashRestarts)
@@ -265,9 +398,17 @@ func (c *Controller) handleRunningHealth(ctx context.Context, vm *v1alpha1.Virtu
 		return c.store.Save(vm)
 	}
 
-	// Attempt self-healing restart
-	entry, found := c.registry.GetImage(vm.Spec.Image.Name)
-	if !found {
+	// Rate-limit restarts to prevent tight spin loops if process crashes immediately
+	minRestartInterval := 200 * time.Millisecond
+	if elapsed := time.Since(vm.Status.LastTransitionTime); elapsed < minRestartInterval {
+		select {
+		case <-time.After(minRestartInterval - elapsed):
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+
+	if !obs.ImageExists || obs.ImagePath == "" {
 		c.unwindResources(vm.Metadata.Name)
 		vm.Status.Phase = v1alpha1.PhaseFailed
 		vm.Status.Message = "Image vanished during restart attempt"
@@ -275,16 +416,7 @@ func (c *Controller) handleRunningHealth(ctx context.Context, vm *v1alpha1.Virtu
 		return c.store.Save(vm)
 	}
 
-	imagePath, err := c.registry.GetImagePath(entry.Filename)
-	if err != nil {
-		c.unwindResources(vm.Metadata.Name)
-		vm.Status.Phase = v1alpha1.PhaseFailed
-		vm.Status.Message = fmt.Sprintf("Invalid image path: %v", err)
-		vm.Status.LastTransitionTime = time.Now().UTC()
-		return c.store.Save(vm)
-	}
-
-	newPid, err := c.runtime.Start(ctx, vm, imagePath)
+	newPid, err := c.runtime.Start(ctx, vm, obs.ImagePath)
 	if err != nil {
 		vm.Status.Message = fmt.Sprintf("Self-healing restart attempt failed: %v", err)
 		vm.Status.LastTransitionTime = time.Now().UTC()
