@@ -255,3 +255,43 @@ Google engineering culture mandates automated continuous integration (CI) before
 3. **Automated Unit Testing & Coverage:** Runs on both Linux and Windows runners on every pull request to prevent regressions.
 
 ---
+
+## Module 9: Subnet IP Address Management (IPAM) (`pkg/ipam/ipam.go`)
+
+### 1. Conceptual Foundation
+In cloud and virtualization clusters, virtual machines need network endpoints within an air-gapped host-only subnet (e.g., `10.244.0.0/24`).
+Random IP assignment causes two catastrophic production bugs:
+1. **IP Collisions:** Two distinct VMs receive the same IP, corrupting ARP tables and routing.
+2. **IP Exhaustion & Leaks:** When a VM is deleted, its IP is never reclaimed, eventually exhausting the subnet.
+
+In `gdc-vm-operator`, `pkg/ipam` implements a deterministic subnet manager:
+* Parses standard CIDR notation using Go's `net.ParseCIDR`.
+* Reserves network address (`.0`), default gateway (`.1`), and broadcast address (`.255`).
+* Sequentially allocates available host IPs (`.2` through `.254`).
+* Guarantees idempotency (re-querying returns the current lease).
+* Automatically reclaims IPs on VM termination.
+
+### 2. Google Interview Q&A
+**Q: How do you handle networking and prevent IP exhaustion in your virtualization operator?**  
+*Answer:*  
+> *"I implemented a dedicated IPAM engine in `pkg/ipam` managing a `10.244.0.0/24` CIDR block. During provisioning, the reconciler requests an IP lease from IPAM, which performs thread-safe allocation while reserving network, gateway, and broadcast boundaries. When the reconciler executes the termination phase, it reclaims the IP back into the available pool, preventing address leaks across frequent VM lifecycles."*
+
+---
+
+## Module 10: Host Node Capacity & Admission Scheduler (`pkg/scheduler/scheduler.go`)
+
+### 1. Conceptual Foundation
+In distributed infrastructure, individual VM validation is not enough. If a physical node has 16 vCPUs and 32 GB RAM, admitting 10 VMs each requesting 4 vCPUs will crash the physical host node via kernel Out-Of-Memory (OOM) killer.
+
+`pkg/scheduler` models the core principles of **`kube-scheduler`**:
+* **Capacity Tracking:** Tracks physical node hardware (`TotalVCPU`, `TotalMemoryMB`, `TotalDiskGB`).
+* **Admission Guard:** Before provisioning, `CanSchedule(vm)` checks if adding the requested resources exceeds node limits.
+* **Queuing:** If node capacity is saturated, the VM remains in `Pending` phase with condition `Reason: InsufficientCapacity` until an existing VM terminates.
+* **Reservation Lifecycle:** Locks committed capacity upon admission and releases it on termination.
+
+### 2. Google Interview Q&A
+**Q: How does your operator prevent noisy-neighbor resource starvation or host node OOM crashes?**  
+*Answer:*  
+> *"I built a node capacity scheduler in `pkg/scheduler` inspired by `kube-scheduler`. The operator tracks cumulative host vCPU, memory, and disk commitments. During the validation phase, the reconciler checks `CanSchedule(vm)`. If the request would overcommit the physical node, the VM is queued in `Pending` with a descriptive condition, preventing host kernel panic or CPU starvation until peer workloads terminate and capacity is freed."*
+
+---

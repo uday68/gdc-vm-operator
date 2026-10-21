@@ -50,7 +50,7 @@ func setupTestEnvironment(t *testing.T) (*Controller, store.Store, runtime.VMRun
 		t.Fatalf("failed to init runtime: %v", err)
 	}
 
-	ctrl := NewController(s, v, reg, rt, 500*time.Millisecond)
+	ctrl := NewController(s, v, reg, rt, nil, nil, 500*time.Millisecond)
 
 	cleanup := func() {
 		os.RemoveAll(tempDir)

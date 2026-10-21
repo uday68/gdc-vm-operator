@@ -4,13 +4,14 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"math/rand"
 	"sync"
 	"time"
 
 	"github.com/uday68/gdc-vm-operator/api/v1alpha1"
+	"github.com/uday68/gdc-vm-operator/pkg/ipam"
 	"github.com/uday68/gdc-vm-operator/pkg/registry"
 	"github.com/uday68/gdc-vm-operator/pkg/runtime"
+	"github.com/uday68/gdc-vm-operator/pkg/scheduler"
 	"github.com/uday68/gdc-vm-operator/pkg/store"
 	"github.com/uday68/gdc-vm-operator/pkg/validator"
 )
@@ -23,6 +24,8 @@ type Controller struct {
 	validator *validator.Validator
 	registry  *registry.LocalRegistry
 	runtime   runtime.VMRuntime
+	ipam      *ipam.IPAM
+	scheduler *scheduler.Scheduler
 	interval  time.Duration
 	stopChan  chan struct{}
 	wg        sync.WaitGroup
@@ -35,16 +38,26 @@ func NewController(
 	v *validator.Validator,
 	reg *registry.LocalRegistry,
 	rt runtime.VMRuntime,
+	ip *ipam.IPAM,
+	sched *scheduler.Scheduler,
 	interval time.Duration,
 ) *Controller {
 	if interval <= 0 {
 		interval = 2 * time.Second
+	}
+	if ip == nil {
+		ip, _ = ipam.NewIPAM("10.244.0.0/24")
+	}
+	if sched == nil {
+		sched = scheduler.NewScheduler(16, 32768, 1000)
 	}
 	return &Controller{
 		store:     s,
 		validator: v,
 		registry:  reg,
 		runtime:   rt,
+		ipam:      ip,
+		scheduler: sched,
 		interval:  interval,
 		stopChan:  make(chan struct{}),
 	}
@@ -123,10 +136,24 @@ func (c *Controller) handleValidation(vm *v1alpha1.VirtualMachine) error {
 		return c.store.Save(vm)
 	}
 
-	vm.Status.Phase = v1alpha1.PhaseProvisioning
-	vm.Status.Message = "Validation passed. Scheduling resources and disk image."
-	vm.Status.LastTransitionTime = time.Now()
 	vm.SetCondition("Validated", v1alpha1.ConditionTrue, "AdmissionSuccess", "All air-gap and hardware constraints satisfied")
+
+	// Host Node Capacity Admission (Scheduler)
+	canSchedule, reason := c.scheduler.CanSchedule(vm)
+	if !canSchedule {
+		vm.Status.Phase = v1alpha1.PhasePending
+		vm.Status.Message = fmt.Sprintf("Queued: %s", reason)
+		vm.Status.LastTransitionTime = time.Now()
+		vm.SetCondition("Scheduled", v1alpha1.ConditionFalse, "InsufficientCapacity", reason)
+		return c.store.Save(vm)
+	}
+
+	_ = c.scheduler.Reserve(vm)
+	vm.SetCondition("Scheduled", v1alpha1.ConditionTrue, "CapacityReserved", "Host resources allocated")
+
+	vm.Status.Phase = v1alpha1.PhaseProvisioning
+	vm.Status.Message = "Validation passed & host resources reserved. Scheduling image attachment."
+	vm.Status.LastTransitionTime = time.Now()
 	return c.store.Save(vm)
 }
 
@@ -137,6 +164,16 @@ func (c *Controller) handleProvisioning(ctx context.Context, vm *v1alpha1.Virtua
 		vm.Status.Message = fmt.Sprintf("Image %s not found in registry catalog", vm.Spec.Image.Name)
 		vm.Status.LastTransitionTime = time.Now()
 		vm.SetCondition("Provisioned", v1alpha1.ConditionFalse, "ImageNotFound", vm.Status.Message)
+		return c.store.Save(vm)
+	}
+
+	// Deterministic IP Allocation via Subnet IPAM
+	ip, err := c.ipam.Allocate(vm.Metadata.Name)
+	if err != nil {
+		vm.Status.Phase = v1alpha1.PhasePending
+		vm.Status.Message = fmt.Sprintf("Network allocation paused: %v", err)
+		vm.Status.LastTransitionTime = time.Now()
+		vm.SetCondition("NetworkReady", v1alpha1.ConditionFalse, "IPAMPoolExhausted", err.Error())
 		return c.store.Save(vm)
 	}
 
@@ -152,10 +189,11 @@ func (c *Controller) handleProvisioning(ctx context.Context, vm *v1alpha1.Virtua
 
 	vm.Status.Phase = v1alpha1.PhaseRunning
 	vm.Status.PID = pid
-	vm.Status.AllocatedIP = fmt.Sprintf("10.244.0.%d", 10+rand.Intn(200))
-	vm.Status.Message = fmt.Sprintf("Virtual machine active on host with PID %d", pid)
+	vm.Status.AllocatedIP = ip
+	vm.Status.Message = fmt.Sprintf("Virtual machine active on host with PID %d, IP %s", pid, ip)
 	vm.Status.LastTransitionTime = time.Now()
 	vm.SetCondition("Ready", v1alpha1.ConditionTrue, "VMRunning", vm.Status.Message)
+	vm.SetCondition("NetworkReady", v1alpha1.ConditionTrue, "IPAllocated", fmt.Sprintf("Bound to subnet IP %s", ip))
 	return c.store.Save(vm)
 }
 
@@ -222,6 +260,10 @@ func (c *Controller) handleTerminating(ctx context.Context, vm *v1alpha1.Virtual
 	if vm.Status.PID > 0 {
 		_ = c.runtime.Stop(vm.Status.PID)
 	}
+	// Release network IP back to CIDR pool
+	c.ipam.Release(vm.Metadata.Name)
+	// Release host CPU/RAM back to node capacity scheduler
+	c.scheduler.Release(vm.Metadata.Name)
 	// Object cleaned up from store
 	return c.store.Delete(vm.Metadata.Name)
 }

@@ -12,9 +12,11 @@ import (
 	"time"
 
 	"github.com/uday68/gdc-vm-operator/api/v1alpha1"
+	"github.com/uday68/gdc-vm-operator/pkg/ipam"
 	"github.com/uday68/gdc-vm-operator/pkg/reconciler"
 	"github.com/uday68/gdc-vm-operator/pkg/registry"
 	"github.com/uday68/gdc-vm-operator/pkg/runtime"
+	"github.com/uday68/gdc-vm-operator/pkg/scheduler"
 	"github.com/uday68/gdc-vm-operator/pkg/store"
 	"github.com/uday68/gdc-vm-operator/pkg/telemetry"
 	"github.com/uday68/gdc-vm-operator/pkg/validator"
@@ -51,6 +53,8 @@ func main() {
 		cmdDelete(args)
 	case "images":
 		cmdImages()
+	case "capacity", "node":
+		cmdCapacity()
 	case "help", "--help", "-h":
 		printUsage()
 	default:
@@ -76,10 +80,11 @@ Available Commands:
   logs <name>              Inspect guest console and boot logs for a VM
   delete <name>            Gracefully terminate and delete a Virtual Machine
   images                   List registered images in the offline air-gapped catalog
+  capacity                 Inspect host node compute (CPU, RAM, Disk) and IPAM subnet capacity
 `)
 }
 
-func getComponents() (store.Store, *registry.LocalRegistry, *validator.Validator, runtime.VMRuntime) {
+func getComponents() (store.Store, *registry.LocalRegistry, *validator.Validator, runtime.VMRuntime, *ipam.IPAM, *scheduler.Scheduler) {
 	stateDir := filepath.Join(defaultDataDir, "state")
 	regDir := filepath.Join(defaultDataDir, "registry")
 	logsDir := filepath.Join(defaultDataDir, "logs")
@@ -109,7 +114,20 @@ func getComponents() (store.Store, *registry.LocalRegistry, *validator.Validator
 		os.Exit(1)
 	}
 
-	return s, reg, val, rt
+	ipamMgr, _ := ipam.NewIPAM("10.244.0.0/24")
+	sched := scheduler.NewScheduler(16, 32768, 1000)
+
+	// Pre-populate reservations & IPAM from active VMs in state
+	for _, vm := range s.List() {
+		if vm.Status.Phase == v1alpha1.PhaseRunning || vm.Status.Phase == v1alpha1.PhaseProvisioning {
+			_ = sched.Reserve(vm)
+			if vm.Status.AllocatedIP != "" {
+				_, _ = ipamMgr.Allocate(vm.Metadata.Name)
+			}
+		}
+	}
+
+	return s, reg, val, rt, ipamMgr, sched
 }
 
 func cmdInit() {
@@ -184,8 +202,8 @@ spec:
 }
 
 func cmdRunOperator(args []string) {
-	s, reg, val, rt := getComponents()
-	ctrl := reconciler.NewController(s, val, reg, rt, 2*time.Second)
+	s, reg, val, rt, ipamMgr, sched := getComponents()
+	ctrl := reconciler.NewController(s, val, reg, rt, ipamMgr, sched, 2*time.Second)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -249,7 +267,7 @@ func cmdApply(args []string) {
 		return
 	}
 
-	s, _, _, _ := getComponents()
+	s, _, _, _, _, _ := getComponents()
 
 	// If new, set initial status
 	existing, _ := s.Get(vm.Metadata.Name)
@@ -278,7 +296,7 @@ func cmdGet(args []string) {
 	}
 
 	target := args[0]
-	s, _, _, _ := getComponents()
+	s, _, _, _, _, _ := getComponents()
 
 	if target == "vms" || target == "vm" && len(args) == 1 {
 		vms := s.List()
@@ -337,7 +355,7 @@ func cmdDescribe(args []string) {
 	}
 
 	name := args[0]
-	s, _, _, _ := getComponents()
+	s, _, _, _, _, _ := getComponents()
 
 	vm, err := s.Get(name)
 	if err != nil {
@@ -377,7 +395,7 @@ func cmdLogs(args []string) {
 		return
 	}
 	name := args[0]
-	_, _, _, rt := getComponents()
+	_, _, _, rt, _, _ := getComponents()
 	logs, err := rt.GetLogs(name)
 	if err != nil {
 		fmt.Printf("Failed to get logs: %v\n", err)
@@ -392,7 +410,7 @@ func cmdDelete(args []string) {
 		return
 	}
 	name := args[0]
-	s, _, _, _ := getComponents()
+	s, _, _, _, _, _ := getComponents()
 	vm, err := s.Get(name)
 	if err != nil {
 		fmt.Println(err)
@@ -407,7 +425,7 @@ func cmdDelete(args []string) {
 }
 
 func cmdImages() {
-	_, reg, _, _ := getComponents()
+	_, reg, _, _, _, _ := getComponents()
 	images := reg.ListImages()
 	w := tabwriter.NewWriter(os.Stdout, 0, 0, 3, ' ', 0)
 	fmt.Fprintln(w, "NAME\tFILE\tOS\tSIZE (BYTES)\tSHA256 CHECKSUM")
@@ -415,4 +433,21 @@ func cmdImages() {
 		fmt.Fprintf(w, "%s\t%s\t%s\t%d\t%s\n", img.Name, img.Filename, img.OSFamily, img.SizeBytes, img.SHA256)
 	}
 	w.Flush()
+}
+
+func cmdCapacity() {
+	_, _, _, _, ipamMgr, sched := getComponents()
+	cap := sched.CapacityReport()
+	allocIPs, totalIPs := ipamMgr.Stats()
+
+	fmt.Println("GDC Host Node Resource Capacity & Network Report:")
+	fmt.Println("-------------------------------------------------")
+	fmt.Printf("vCPU:       Total: %-4d | Allocated: %-4d | Available: %-4d (%.1f%% utilized)\n",
+		cap.TotalVCPU, cap.AllocatedVCPU, cap.AvailableVCPU, float64(cap.AllocatedVCPU)/float64(cap.TotalVCPU)*100)
+	fmt.Printf("Memory:     Total: %-4dMB| Allocated: %-4dMB| Available: %-4dMB(%.1f%% utilized)\n",
+		cap.TotalMemoryMB, cap.AllocatedMemory, cap.AvailableMemory, float64(cap.AllocatedMemory)/float64(cap.TotalMemoryMB)*100)
+	fmt.Printf("Disk:       Total: %-4dGB| Allocated: %-4dGB| Available: %-4dGB(%.1f%% utilized)\n",
+		cap.TotalDiskGB, cap.AllocatedDisk, cap.AvailableDisk, float64(cap.AllocatedDisk)/float64(cap.TotalDiskGB)*100)
+	fmt.Printf("IPAM Pool:  Subnet: 10.244.0.0/24 | Allocated IPs: %d | Available IPs: %d\n",
+		allocIPs, totalIPs-allocIPs)
 }
