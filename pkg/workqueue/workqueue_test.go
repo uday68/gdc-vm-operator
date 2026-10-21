@@ -122,3 +122,214 @@ func TestWorkQueue_ConcurrentWorkers(t *testing.T) {
 	}
 }
 
+func TestWorkQueue_AddDuringProcessing(t *testing.T) {
+	q := NewQueue(nil)
+	defer q.ShutDown()
+
+	q.Add("worker-key")
+
+	// 1. Worker gets item
+	item, shutdown := q.Get()
+	if shutdown || item != "worker-key" {
+		t.Fatalf("expected 'worker-key', got '%s'", item)
+	}
+
+	// 2. While item is being processed, add it multiple times
+	q.Add("worker-key")
+	q.Add("worker-key")
+	q.Add("worker-key")
+
+	// Verify it is NOT yet in the queue (since worker is still processing it)
+	if q.Len() != 0 {
+		t.Fatalf("item should not be re-queued while still being processed, got len=%d", q.Len())
+	}
+
+	// 3. Worker finishes processing
+	q.Done(item)
+
+	// Item must now be re-enqueued exactly once
+	if q.Len() != 1 {
+		t.Fatalf("expected item to be re-enqueued exactly once after Done, got len=%d", q.Len())
+	}
+
+	item2, shutdown2 := q.Get()
+	if shutdown2 || item2 != "worker-key" {
+		t.Fatalf("expected 'worker-key' on second pass, got '%s'", item2)
+	}
+	q.Done(item2)
+
+	// Now queue must be empty
+	if q.Len() != 0 {
+		t.Fatalf("queue should be empty after second Done, got len=%d", q.Len())
+	}
+}
+
+func TestWorkQueue_ConcurrentWorkersKeyExclusion(t *testing.T) {
+	q := NewQueue(nil)
+	defer q.ShutDown()
+
+	var mu sync.Mutex
+	activeKeys := make(map[string]int)
+	overlapDetected := false
+
+	const numWorkers = 8
+	var wg sync.WaitGroup
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				key, shutdown := q.Get()
+				if shutdown {
+					return
+				}
+
+				mu.Lock()
+				activeKeys[key]++
+				if activeKeys[key] > 1 {
+					overlapDetected = true
+				}
+				mu.Unlock()
+
+				// Simulate processing duration
+				time.Sleep(5 * time.Millisecond)
+
+				mu.Lock()
+				activeKeys[key]--
+				mu.Unlock()
+
+				q.Done(key)
+			}
+		}()
+	}
+
+	// Rapidly spam duplicate keys across workers
+	keys := []string{"vm-1", "vm-2", "vm-3", "vm-4"}
+	for round := 0; round < 50; round++ {
+		for _, k := range keys {
+			q.Add(k)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+
+	time.Sleep(100 * time.Millisecond)
+	q.ShutDown()
+	wg.Wait()
+
+	if overlapDetected {
+		t.Fatal("Concurrency violation: multiple workers processed the same key simultaneously!")
+	}
+}
+
+func TestWorkQueue_DelayedRetriesAndCleanShutdown(t *testing.T) {
+	q := NewQueue(nil)
+
+	// 1. AddAfter with short delay
+	start := time.Now()
+	q.AddAfter("delayed-key", 50*time.Millisecond)
+
+	item, shutdown := q.Get()
+	if shutdown || item != "delayed-key" {
+		t.Fatalf("expected 'delayed-key', got '%s'", item)
+	}
+	elapsed := time.Since(start)
+	if elapsed < 40*time.Millisecond {
+		t.Fatalf("item returned too early: %v", elapsed)
+	}
+	q.Done(item)
+
+	// 2. Add long delayed item, shutdown immediately
+	q.AddAfter("long-delay", 10*time.Second)
+	shutdownStart := time.Now()
+	q.ShutDown()
+	shutdownElapsed := time.Since(shutdownStart)
+
+	if shutdownElapsed > 1*time.Second {
+		t.Fatalf("ShutDown blocked on delayed item: took %v", shutdownElapsed)
+	}
+
+	// Workers after shutdown must receive shutdown signal
+	_, isShutdown := q.Get()
+	if !isShutdown {
+		t.Fatal("expected Get() to return shutdown=true after ShutDown()")
+	}
+}
+
+func TestWorkQueue_ShutdownWithBlockedWorkers(t *testing.T) {
+	q := NewQueue(nil)
+	const numWorkers = 5
+	var wg sync.WaitGroup
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			item, shutdown := q.Get()
+			if !shutdown {
+				t.Errorf("expected shutdown=true for blocked worker, got item='%s'", item)
+			}
+		}()
+	}
+
+	// Ensure workers are blocked in q.Get()
+	time.Sleep(50 * time.Millisecond)
+
+	start := time.Now()
+	q.ShutDown()
+	wg.Wait()
+
+	if time.Since(start) > 500*time.Millisecond {
+		t.Fatalf("ShutDown took too long to unblock workers: %v", time.Since(start))
+	}
+}
+
+func BenchmarkQueue_Throughput(b *testing.B) {
+	q := NewQueue(nil)
+	defer q.ShutDown()
+
+	go func() {
+		for {
+			item, shutdown := q.Get()
+			if shutdown {
+				return
+			}
+			q.Done(item)
+		}
+	}()
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		q.Add("bench-item")
+	}
+}
+
+func BenchmarkQueue_DuplicatePressure(b *testing.B) {
+	q := NewQueue(nil)
+	defer q.ShutDown()
+
+	const numConsumers = 4
+	for i := 0; i < numConsumers; i++ {
+		go func() {
+			for {
+				item, shutdown := q.Get()
+				if shutdown {
+					return
+				}
+				q.Done(item)
+			}
+		}()
+	}
+
+	keys := []string{"key-1", "key-2", "key-3", "key-4", "key-5"}
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		idx := 0
+		for pb.Next() {
+			q.Add(keys[idx%len(keys)])
+			idx++
+		}
+	})
+}
+
+

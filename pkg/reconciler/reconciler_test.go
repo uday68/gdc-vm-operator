@@ -773,3 +773,75 @@ func TestReconciler_SpecUpdateWhileRunning(t *testing.T) {
 	}
 }
 
+func TestReconciler_QueueKeyHelpers(t *testing.T) {
+	vmWithoutNS := &v1alpha1.VirtualMachine{
+		Metadata: v1alpha1.ObjectMeta{Name: "my-vm"},
+	}
+	key := QueueKey(vmWithoutNS)
+	if key != "my-vm" {
+		t.Errorf("expected 'my-vm', got '%s'", key)
+	}
+	ns, name := SplitQueueKey(key)
+	if ns != "" || name != "my-vm" {
+		t.Errorf("expected empty ns and name 'my-vm', got ns='%s', name='%s'", ns, name)
+	}
+
+	vmWithNS := &v1alpha1.VirtualMachine{
+		Metadata: v1alpha1.ObjectMeta{Namespace: "default", Name: "namespaced-vm"},
+	}
+	keyNS := QueueKey(vmWithNS)
+	if keyNS != "default/namespaced-vm" {
+		t.Errorf("expected 'default/namespaced-vm', got '%s'", keyNS)
+	}
+	ns2, name2 := SplitQueueKey(keyNS)
+	if ns2 != "default" || name2 != "namespaced-vm" {
+		t.Errorf("expected ns 'default' and name 'namespaced-vm', got ns='%s', name='%s'", ns2, name2)
+	}
+}
+
+func TestReconciler_QueueWorkerProcessing(t *testing.T) {
+	ctrl, s, _, _, _, cleanup := setupTestEnvironment(t)
+	defer cleanup()
+
+	mock := newMockRuntime()
+	ctrl.runtime = mock
+	ctrl.SetWorkers(3)
+
+	vm := &v1alpha1.VirtualMachine{
+		Metadata: v1alpha1.ObjectMeta{Name: "queued-worker-vm"},
+		Spec: v1alpha1.VirtualMachineSpec{
+			Resources: v1alpha1.ResourceRequirements{VCPU: 1, MemoryMB: 1024, DiskGB: 10},
+			Image:     v1alpha1.ImageSource{Name: "ubuntu-minimal"},
+		},
+		Status: v1alpha1.VirtualMachineStatus{Phase: v1alpha1.PhasePending},
+	}
+	_ = s.Save(vm)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Start controller with queue workers
+	go ctrl.Start(ctx)
+
+	// Wait for queue workers to pick up the VM and transition it through Provisioning to Running
+	var finalPhase v1alpha1.VMPhase
+	for i := 0; i < 20; i++ {
+		time.Sleep(100 * time.Millisecond)
+		v, err := s.Get("queued-worker-vm")
+		if err == nil {
+			finalPhase = v.Status.Phase
+			if finalPhase == v1alpha1.PhaseRunning {
+				break
+			}
+		}
+	}
+
+	if finalPhase != v1alpha1.PhaseRunning {
+		t.Fatalf("expected queue worker to reconcile VM to PhaseRunning, got: %s", finalPhase)
+	}
+
+	// Graceful shutdown
+	ctrl.Stop()
+}
+
+

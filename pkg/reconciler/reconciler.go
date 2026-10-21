@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -14,9 +15,30 @@ import (
 	"github.com/uday68/gdc-vm-operator/pkg/scheduler"
 	"github.com/uday68/gdc-vm-operator/pkg/store"
 	"github.com/uday68/gdc-vm-operator/pkg/validator"
+	"github.com/uday68/gdc-vm-operator/pkg/workqueue"
 )
 
 const MaxCrashRestarts = 3
+
+// QueueKey generates the stable unique key used to identify a VM in the workqueue.
+func QueueKey(vm *v1alpha1.VirtualMachine) string {
+	if vm == nil {
+		return ""
+	}
+	if vm.Metadata.Namespace != "" {
+		return fmt.Sprintf("%s/%s", vm.Metadata.Namespace, vm.Metadata.Name)
+	}
+	return vm.Metadata.Name
+}
+
+// SplitQueueKey parses a workqueue key into its namespace and name components.
+func SplitQueueKey(key string) (namespace, name string) {
+	parts := strings.Split(key, "/")
+	if len(parts) == 2 {
+		return parts[0], parts[1]
+	}
+	return "", key
+}
 
 // Controller manages the continuous state reconciliation of Virtual Machines.
 type Controller struct {
@@ -26,6 +48,8 @@ type Controller struct {
 	runtime   runtime.VMRuntime
 	ipam      *ipam.IPAM
 	scheduler *scheduler.Scheduler
+	queue     workqueue.WorkQueue
+	workers   int
 	interval  time.Duration
 	stopChan  chan struct{}
 	wg        sync.WaitGroup
@@ -58,43 +82,139 @@ func NewController(
 		runtime:   rt,
 		ipam:      ip,
 		scheduler: sched,
+		queue:     workqueue.NewQueue(nil),
+		workers:   2,
 		interval:  interval,
 		stopChan:  make(chan struct{}),
 	}
 }
 
-// Start initiates the reconciliation control loop.
+// SetWorkers configures the number of concurrent queue workers.
+func (c *Controller) SetWorkers(workers int) *Controller {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if workers <= 0 {
+		workers = 1
+	}
+	c.workers = workers
+	return c
+}
+
+// Queue returns the controller's underlying workqueue.
+func (c *Controller) Queue() workqueue.WorkQueue {
+	return c.queue
+}
+
+// Enqueue adds a VM to the workqueue for reconciliation.
+func (c *Controller) Enqueue(vm *v1alpha1.VirtualMachine) {
+	if vm == nil {
+		return
+	}
+	key := QueueKey(vm)
+	if key != "" {
+		c.queue.Add(key)
+	}
+}
+
+// EnqueueKey adds a VM key directly to the workqueue.
+func (c *Controller) EnqueueKey(key string) {
+	if key != "" {
+		c.queue.Add(key)
+	}
+}
+
+// Start initiates the reconciliation control loop with worker processing.
 func (c *Controller) Start(ctx context.Context) {
-	// Reconcile and reconstruct state on startup before entering loop
+	// 1. Reconcile and reconstruct state on startup before entering loop
 	if err := c.ReconcileRecoveredState(ctx); err != nil {
 		slog.Error("Failed reconciling recovered state on startup", "error", err)
 	}
 
+	// 2. Enqueue all recovered VMs initially into workqueue
+	for _, vm := range c.store.List() {
+		c.Enqueue(vm)
+	}
+
+	// 3. Start worker pool
+	for i := 0; i < c.workers; i++ {
+		c.wg.Add(1)
+		go func(workerID int) {
+			defer c.wg.Done()
+			c.runWorker(ctx, workerID)
+		}(i)
+	}
+
+	// 4. Background level-triggered ticker enqueuing items into workqueue
 	ticker := time.NewTicker(c.interval)
 	defer ticker.Stop()
 
 	for {
 		select {
 		case <-ctx.Done():
+			c.Stop()
 			return
 		case <-c.stopChan:
 			return
 		case <-ticker.C:
-			c.ReconcileAll(ctx)
+			for _, vm := range c.store.List() {
+				c.Enqueue(vm)
+			}
 		}
 	}
 }
 
-// Stop gracefully shuts down the background control loop.
+func (c *Controller) runWorker(ctx context.Context, workerID int) {
+	for {
+		key, shutdown := c.queue.Get()
+		if shutdown {
+			return
+		}
+
+		err := c.processKey(ctx, key)
+		c.queue.Done(key)
+
+		if err != nil {
+			slog.Error("Worker failed reconciling VM", "workerID", workerID, "key", key, "error", err)
+			if c.queue.NumRequeues(key) < MaxCrashRestarts*2 {
+				delay := c.queue.AddRateLimited(key)
+				slog.Debug("Requeued VM with rate limiting", "key", key, "delay", delay)
+			} else {
+				c.queue.Forget(key)
+				slog.Error("Exceeded max retry attempts, dropping VM key from queue", "key", key)
+			}
+		} else {
+			c.queue.Forget(key)
+		}
+	}
+}
+
+func (c *Controller) processKey(ctx context.Context, key string) error {
+	_, name := SplitQueueKey(key)
+	vm, err := c.store.Get(name)
+	if err != nil {
+		// VM was deleted from store; no state to reconcile
+		return nil
+	}
+	return c.ReconcileOne(ctx, vm)
+}
+
+// Stop gracefully shuts down the worker pool, stops the workqueue, and waits for worker termination.
 func (c *Controller) Stop() {
 	c.mu.Lock()
-	defer c.mu.Unlock()
 	select {
 	case <-c.stopChan:
-		// already stopped
+		c.mu.Unlock()
+		return
 	default:
 		close(c.stopChan)
 	}
+	c.mu.Unlock()
+
+	// Shut down workqueue: stops intake, cancels delayed retries, and broadcasts to unblock all workers
+	c.queue.ShutDown()
+
+	// Wait for all worker goroutines to complete
+	c.wg.Wait()
 }
 
 // RuntimeObservation captures live facts discovered dynamically during reconciliation.
