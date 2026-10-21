@@ -50,3 +50,4 @@ func TestScheduler_CapacityAdmissionAndRelease(t *testing.T) {
 		t.Fatalf("expected VM2 to be schedulable after VM1 was released")
 	}
 }
+

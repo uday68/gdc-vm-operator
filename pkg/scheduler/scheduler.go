@@ -136,3 +136,4 @@ func (s *Scheduler) currentAllocationsLocked() (vcpu, mem, disk int) {
 	}
 	return vcpu, mem, disk
 }
+

@@ -57,3 +57,4 @@ func TestIPAM_Lifecycle(t *testing.T) {
 		t.Errorf("expected reclaimed IP 10.244.1.4, got %s", reclaimedIP)
 	}
 }
+

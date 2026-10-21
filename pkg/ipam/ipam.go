@@ -95,3 +95,4 @@ func (ipam *IPAM) Stats() (allocated int, total int) {
 	defer ipam.mu.RUnlock()
 	return len(ipam.allocated), int(ipam.totalIPs - 3)
 }
+
