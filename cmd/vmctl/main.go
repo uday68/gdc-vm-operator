@@ -562,12 +562,13 @@ func cmdSnapshot(args []string) {
 
 	case "restore":
 		if len(args) < 4 {
-			fmt.Println("Usage: vmctl snapshot restore <vm-name> <snapshot-name> <target-disk-path>")
+			fmt.Println("Usage: vmctl snapshot restore <vm-name> <snapshot-name> <target-disk-path> [--force]")
 			return
 		}
 		snapName := args[2]
 		targetPath := args[3]
-		meta, err := mgr.Restore(vmName, snapName, targetPath)
+		allowOverwrite := len(args) >= 5 && (args[4] == "--force" || args[4] == "--overwrite")
+		meta, err := mgr.Restore(vmName, snapName, targetPath, allowOverwrite)
 		if err != nil {
 			fmt.Printf("Failed to restore snapshot: %v\n", err)
 			return
