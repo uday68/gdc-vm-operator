@@ -151,7 +151,24 @@ go test -v ./...
 
 ---
 
-## 5. System Design & Interview Reference
+## 5. Performance Benchmarks
+
+Measured on a 12th Gen Intel(R) Core(TM) i5-12450H (Windows amd64):
+
+| Benchmark | Iterations | Latency / Throughput | Memory Allocations | Notes |
+| :--- | :--- | :--- | :--- | :--- |
+| **Workqueue Throughput** (`BenchmarkQueue_Throughput`) | 14,759,748 | **83.25 ns/op** (~12.0M ops/sec) | **0 B/op, 0 allocs/op** | Zero-allocation dirty-key tracking and dispatching |
+| **Duplicate Pressure** (`BenchmarkQueue_DuplicatePressure`) | 5,088,334 | **286.0 ns/op** (~3.5M ops/sec) | **0 B/op, 0 allocs/op** | Zero-allocation state coalescing under event storm |
+| **Snapshot Streaming** (`BenchmarkSnapshot_SyntheticLargeArtifact`) | 6 | **22.23 MB/s** (235.87 ms/5MB) | 181,037 B/op, 391 allocs/op | Streaming $O(1)$ SHA-256 copy + atomic replacement |
+
+Run benchmarks locally:
+```bash
+go test -bench=Benchmark -benchmem -run=^$ ./pkg/workqueue ./pkg/snapshot
+```
+
+---
+
+## 6. System Design & Interview Reference
 
 For deep-dive technical explanations, memory efficiency patterns (`io.Copy`), concurrency considerations (`sync.RWMutex`), and exact Google interview talking points, consult the [Interview Study Guide](docs/INTERVIEW_STUDY_GUIDE.md).
 
