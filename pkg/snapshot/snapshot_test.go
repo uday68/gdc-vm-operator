@@ -74,3 +74,4 @@ func TestSnapshotManager_Lifecycle(t *testing.T) {
 		t.Errorf("restored payload mismatch: expected '%s', got '%s'", originalPayload, restoredBytes)
 	}
 }
+

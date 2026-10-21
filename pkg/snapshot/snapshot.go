@@ -188,3 +188,4 @@ func (m *Manager) List(vmName string) ([]SnapshotMeta, error) {
 
 	return results, nil
 }
+

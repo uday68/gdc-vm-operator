@@ -121,3 +121,4 @@ func TestWorkQueue_ConcurrentWorkers(t *testing.T) {
 		t.Errorf("expected 20 processed items, got %d", processedCount)
 	}
 }
+
