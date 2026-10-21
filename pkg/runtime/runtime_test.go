@@ -73,3 +73,4 @@ func TestProcessVMRuntime_Lifecycle(t *testing.T) {
 		t.Errorf("expected PID %d to be dead after Stop", pid)
 	}
 }
+

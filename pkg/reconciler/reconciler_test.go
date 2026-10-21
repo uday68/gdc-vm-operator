@@ -159,3 +159,4 @@ func TestReconciler_AirGapRejection(t *testing.T) {
 		t.Fatalf("expected PhaseFailed for air-gap violation, got %s", v.Status.Phase)
 	}
 }
+

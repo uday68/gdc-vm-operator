@@ -127,3 +127,4 @@ func (r *ProcessVMRuntime) GetLogs(vmName string) (string, error) {
 	}
 	return string(data), nil
 }
+

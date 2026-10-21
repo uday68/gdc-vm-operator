@@ -3,6 +3,7 @@ package reconciler
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"math/rand"
 	"sync"
 	"time"
@@ -83,8 +84,8 @@ func (c *Controller) ReconcileAll(ctx context.Context) {
 	vms := c.store.List()
 	for _, vm := range vms {
 		if err := c.ReconcileOne(ctx, vm); err != nil {
-			// Log error without aborting reconciliation of peer VMs
-			fmt.Printf("[RECONCILER ERROR] Failed reconciling VM %s: %v\n", vm.Metadata.Name, err)
+			// Structured log without halting peer reconciliation
+			slog.Error("Failed reconciling virtual machine", "name", vm.Metadata.Name, "error", err)
 		}
 	}
 }
@@ -166,7 +167,11 @@ func (c *Controller) handleRunningHealth(ctx context.Context, vm *v1alpha1.Virtu
 	}
 
 	// Process died! Self-healing reconciliation triggered.
-	fmt.Printf("[SELF-HEALING] Detected crash of VM %s (PID %d)\n", vm.Metadata.Name, vm.Status.PID)
+	slog.Warn("Process crash detected, triggering self-healing recovery",
+		"vm", vm.Metadata.Name,
+		"crashedPID", vm.Status.PID,
+		"previousRestarts", vm.Status.RestartCount,
+	)
 
 	policy := vm.Spec.RestartPolicy
 	if policy == "" {
@@ -220,3 +225,4 @@ func (c *Controller) handleTerminating(ctx context.Context, vm *v1alpha1.Virtual
 	// Object cleaned up from store
 	return c.store.Delete(vm.Metadata.Name)
 }
+

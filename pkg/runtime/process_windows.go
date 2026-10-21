@@ -30,3 +30,4 @@ func checkProcessAlive(pid int) bool {
 
 	return exitCode == stillActive
 }
+

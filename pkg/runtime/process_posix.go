@@ -22,3 +22,4 @@ func checkProcessAlive(pid int) bool {
 	err = proc.Signal(syscall.Signal(0))
 	return err == nil
 }
+

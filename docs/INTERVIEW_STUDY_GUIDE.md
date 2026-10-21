@@ -217,3 +217,41 @@ flowchart TD
 > *"Edge-triggered controllers only react when an event notification arrives; if the notification is dropped or the controller was restarting during the event, the system remains broken. Level-triggered controllers, like Kubernetes and `gdc-vm-operator`, inspect the current state on every loop iteration. Even if an event was missed, the reconciler discovers the discrepancy between desired and actual state and self-heals."*
 
 ---
+
+## Module 7: Observability & Kubernetes Telemetry (`pkg/telemetry/server.go`)
+
+### 1. Conceptual Foundation
+In cloud and distributed systems, operators run unattended inside Kubernetes pods. Operators that crash silently without exposing diagnostics are forbidden in production environments.
+Kubernetes relies on two fundamental HTTP probe endpoints:
+* **Liveness Probe (`/healthz`):** Verifies if the operator process is alive. If this returns non-200, Kubernetes automatically terminates and replaces the controller container.
+* **Readiness Probe (`/readyz`):** Verifies if the operator is ready to accept traffic and reconcile objects (e.g., verifying local state store connectivity).
+* **Prometheus Metrics (`/metrics`):** Exposes metrics scraped by Prometheus to plot Grafana dashboards:
+  * `gdc_vms_total` (gauge)
+  * `gdc_vms_running` (gauge)
+  * `gdc_vms_failed` (gauge)
+  * `gdc_vms_degraded` (gauge)
+  * `gdc_vm_restarts_total` (counter)
+
+### 2. Key Go Concepts Used
+1. **Standard Library Structured Logging (`log/slog`):**
+   * Introduced in Go 1.21, `slog` replaces informal `fmt.Println` statements with strongly-typed, structured key-value pairs (`slog.Warn("Process crash detected", "vm", name, "crashedPID", pid)`).
+   * This allows Google Cloud Logging (Stackdriver) and OpenTelemetry to index log attributes and power alerts without fragile regex parsing.
+2. **Graceful HTTP Server Shutdown:**
+   * When the operator receives an OS interrupt (`SIGTERM`), it calls `httpServer.Shutdown(ctx)` with a 3-second grace period. This ensures inflight health probe requests complete cleanly before port 8080 closes.
+
+### 3. Google Interview Q&A
+**Q: How do you monitor and expose telemetry for your Kubernetes operator?**  
+*Answer:*  
+> *"I built an embedded HTTP telemetry server in `pkg/telemetry` running concurrently on port 8080. It provides standard `/healthz` and `/readyz` endpoints for Kubernetes kubelet probes, as well as a `/metrics` endpoint formatted for Prometheus scraping. Metrics like `gdc_vm_restarts_total` and `gdc_vms_degraded` track self-healing occurrences and CrashLoopBackoffs in real time."*
+
+---
+
+## Module 8: Production CI/CD & Build Matrix (`.github/workflows/ci.yml`)
+
+### 1. Conceptual Foundation
+Google engineering culture mandates automated continuous integration (CI) before code is merged:
+1. **Static Analysis (`go vet ./...`):** Enforces idiomatic code style, detects shadowed variables, unreachable code, and misuse of formatting primitives.
+2. **Cross-Compilation Matrix:** Verifies that code compiles cleanly across multiple operating systems (`linux`, `windows`, `darwin`) and CPU architectures (`amd64`, `arm64`) using Go's built-in cross-compiler (`GOOS` and `GOARCH`).
+3. **Automated Unit Testing & Coverage:** Runs on both Linux and Windows runners on every pull request to prevent regressions.
+
+---

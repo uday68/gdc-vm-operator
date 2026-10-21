@@ -161,3 +161,4 @@ func deepCopyVM(orig *v1alpha1.VirtualMachine) (*v1alpha1.VirtualMachine, error)
 	}
 	return &clone, nil
 }
+

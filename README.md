@@ -1,8 +1,10 @@
 # GDC Air-Gapped Virtual Machine Operator (`gdc-vm-operator`)
 
+[![CI Pipeline](https://github.com/uday68/gdc-vm-operator/actions/workflows/ci.yml/badge.svg)](https://github.com/uday68/gdc-vm-operator/actions)
 [![Go Version](https://img.shields.io/badge/Go-1.26+-00ADD8?style=flat&logo=go)](https://golang.org)
 [![Build & Test Status](https://img.shields.io/badge/Tests-100%25%20Passing-brightgreen)]()
 [![Architecture](https://img.shields.io/badge/Architecture-Kubernetes%20Operator-blue)]()
+[![Observability](https://img.shields.io/badge/Observability-Prometheus%20%2B%20Probes-orange)]()
 [![Security](https://img.shields.io/badge/Security-Air--Gapped%20Zero--Trust-red)]()
 
 A lightweight, production-grade **Air-Gapped Virtual Machine Lifecycle Operator and CLI in Go**, designed to mirror the architectural paradigms of **Google Distributed Cloud (GDC) Virtual Machine Infrastructure**.
@@ -144,3 +146,4 @@ go test -v ./...
 ## 5. System Design & Interview Reference
 
 For deep-dive technical explanations, memory efficiency patterns (`io.Copy`), concurrency considerations (`sync.RWMutex`), and exact Google interview talking points, consult the [Interview Study Guide](docs/INTERVIEW_STUDY_GUIDE.md).
+

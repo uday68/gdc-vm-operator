@@ -16,6 +16,7 @@ import (
 	"github.com/uday68/gdc-vm-operator/pkg/registry"
 	"github.com/uday68/gdc-vm-operator/pkg/runtime"
 	"github.com/uday68/gdc-vm-operator/pkg/store"
+	"github.com/uday68/gdc-vm-operator/pkg/telemetry"
 	"github.com/uday68/gdc-vm-operator/pkg/validator"
 	"gopkg.in/yaml.v3"
 )
@@ -60,7 +61,7 @@ func main() {
 }
 
 func printUsage() {
-	fmt.Println(`GDC Air-Gapped Virtual Machine Operator CLI (vmctl)
+	fmt.Print(`GDC Air-Gapped Virtual Machine Operator CLI (vmctl)
 
 Usage:
   vmctl <command> [arguments]
@@ -202,8 +203,18 @@ func cmdRunOperator(args []string) {
 	fmt.Println("===================================================================")
 	fmt.Println(" GDC Air-Gapped Virtual Machine Operator Reconciler Started        ")
 	fmt.Println(" Control Loop: Level-triggered ticker every 2s                     ")
+	fmt.Println(" Observability: Telemetry endpoints active at http://localhost:8080")
+	fmt.Println("   - Liveness Probe:  /healthz                                     ")
+	fmt.Println("   - Readiness Probe: /readyz                                      ")
+	fmt.Println("   - Metrics:         /metrics (Prometheus format)                 ")
 	fmt.Println(" Press Ctrl+C to terminate cleanly                                 ")
 	fmt.Println("===================================================================")
+
+	// Launch Prometheus and Health Telemetry server
+	telemetrySrv := telemetry.NewServer(8080, s)
+	go func() {
+		_ = telemetrySrv.Start(ctx)
+	}()
 
 	go ctrl.Start(ctx)
 
